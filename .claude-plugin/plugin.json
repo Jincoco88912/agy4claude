@@ -1,0 +1,26 @@
+{
+  "name": "agy-bridge",
+  "version": "0.2.0",
+  "description": "Drive Antigravity CLI (agy) on this machine as a sub-agent of Claude Code, with a live output pane.",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "agy_path": {
+      "type": "string",
+      "title": "agy executable",
+      "description": "Command or full path of the Antigravity CLI, e.g. agy, /opt/homebrew/bin/agy or C:\\Users\\me\\AppData\\Local\\agy\\bin\\agy.exe",
+      "default": "agy"
+    },
+    "default_cwd": {
+      "type": "string",
+      "title": "Default working directory",
+      "description": "Directory agy runs in when a tool call gives none; empty uses the Claude Code session's own directory",
+      "default": ""
+    },
+    "model": {
+      "type": "string",
+      "title": "agy model",
+      "description": "agy --model slug; empty uses agy's default",
+      "default": ""
+    }
+  }
+}
