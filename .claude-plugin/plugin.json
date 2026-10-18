@@ -1,6 +1,6 @@
 {
-  "name": "agy-bridge",
-  "version": "0.3.0",
+  "name": "agy4claude",
+  "version": "1.0.0",
   "description": "Drive Antigravity CLI (agy) on this machine as a sub-agent of Claude Code, with a live output pane.",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -19,7 +19,7 @@
     "model": {
       "type": "string",
       "title": "agy model",
-      "description": "agy --model slug; empty uses agy's default",
+      "description": "agy --model slug (see `agy models`); empty uses agy's default. The pane can change it",
       "default": ""
     },
     "effort": {
@@ -33,6 +33,48 @@
       "title": "Default agent",
       "description": "Name of an agy agent (see `agy agents`) to run tasks with unless the tool call gives one; empty uses agy's default",
       "default": ""
+    },
+    "profiles_dir": {
+      "type": "string",
+      "title": "Extra sign-ins folder",
+      "description": "Folder whose subfolders are extra agy sign-ins, each used as HOME (sign one in with: HOME=<folder>/<name> agy). Runs rotate through them in name order, then the main sign-in, picking the first with Gemini quota left. Empty uses ~/.agy-profiles; a missing folder means the main sign-in only",
+      "default": ""
+    },
+    "account_order": {
+      "type": "string",
+      "title": "Sign-in order",
+      "description": "Comma-separated sign-in names in the order runs try them, e.g. work,spare,main. Sign-ins left out are not used. Empty: the profiles by name, then main",
+      "default": ""
+    },
+    "rotation": {
+      "type": "string",
+      "title": "Rotation",
+      "description": "How runs pick among sign-ins with quota left: ordered (first in order, so later ones are kept in reserve), round-robin (the next one each run), random, or most-left (the one with the most quota left). The pane can change it",
+      "default": "ordered"
+    },
+    "language": {
+      "type": "string",
+      "title": "Language",
+      "description": "Language of the pane and the /agy replies: auto (follows LANG), en or zh-TW. The pane can change it",
+      "default": "auto"
+    },
+    "claude_price_in": {
+      "type": "number",
+      "title": "Claude input price (US$ per million tokens)",
+      "description": "Used to estimate what each delegated run saved: what its input tokens would have cost on Claude. Default: Claude Opus 5.5",
+      "default": 4
+    },
+    "claude_price_out": {
+      "type": "number",
+      "title": "Claude output price (US$ per million tokens)",
+      "description": "Used to estimate savings for output and thinking tokens. Default: Claude Opus 5.5",
+      "default": 20
+    },
+    "min_quota": {
+      "type": "number",
+      "title": "Minimum Gemini quota (%)",
+      "description": "A sign-in is skipped while its Gemini quota left (the lower of the weekly and five-hour limits) is at or below this percent",
+      "default": 5
     },
     "sandbox": {
       "type": "boolean",

@@ -33,6 +33,8 @@ export type AgyLaunch = {
 
 export type AgyRun = AgyLaunch & {
   job: string
+  /** The agy sign-in the run used: `main` (the real HOME) or a profile folder's name. */
+  account: string
   prompt: string
   /** Working directory agy ran in; empty means the session's own. */
   cwd: string
@@ -50,6 +52,8 @@ export type AgyRun = AgyLaunch & {
   usage?: AgyUsage
   durationSeconds?: number
   numTurns?: number
+  /** What the run would have cost on Claude, in US dollars (an estimate from its token usage). */
+  savedUsd?: number
 }
 
 export type AgyHealth = {
@@ -60,12 +64,54 @@ export type AgyHealth = {
   checkedAt: number
 }
 
+/** One quota pool of a sign-in, as `agy -p /usage` prints it: the lower of its weekly and five-hour limits. */
+export type AgyPoolQuota = {
+  /** Percent left; -1 when it could not be read. */
+  left: number
+  /** When the lower window resets, as agy prints it (ISO time). */
+  resetAt?: string
+}
+
+export type AgyAccountQuota = {
+  name: string
+  /** Gemini models. */
+  gemini: AgyPoolQuota
+  /** Claude and GPT models, a pool of their own. */
+  other: AgyPoolQuota
+}
+
+/** How runs pick a sign-in among those with quota left. */
+export type AgyRotation = 'ordered' | 'round-robin' | 'random' | 'most-left'
+
+/** What the pane's pickers set; kept in the plugin's store, over the plugin options. */
+export type AgySettings = {
+  model: string
+  effort: AgyEffort | ''
+  rotation: AgyRotation
+  /** The pane's language: `auto` follows LANG. */
+  language: 'auto' | 'en' | 'zh-TW'
+}
+
+export type AgyModel = { value: string; label: string }
+
+export type AgyQuota = {
+  accounts: AgyAccountQuota[]
+  checkedAt: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
-    'agy-bridge': {
+    'agy4claude': {
       runs: AgyRun[]
       lastConversation: string | null
       health: AgyHealth | null
+      quota: AgyQuota | null
+      models: AgyModel[]
+      /** Bumped on the plugin's clock so the stage animates. */
+      frame: number
+      settingsOpen: boolean
+      /** Runs whose long reply is shown whole. */
+      expanded: string[]
     }
   }
 }

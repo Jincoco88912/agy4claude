@@ -1,10 +1,12 @@
-import type { EngineInterface, HookStream, ProcessSpawnChunk, ProcessSpawnResult, Register, Timer } from 'claude-code'
+import type { ElementConstructor, EngineInterface, HookStream, ProcessSpawnChunk, ProcessSpawnResult, Register, SelectProps, SvgProps, Timer } from 'claude-code'
+import { atom, update } from 'claude-code'
 
-import type { AgyEffort, AgyHealth, AgyLaunch, AgyMode, AgyRun, AgyStep, AgyUsage } from '../types'
+import { CLAUDE_AVATAR, LOGO_SVG, ROBOT_AVATAR, fmtUsd, moodOf, savedUsd, savingsSvg, stageSvg } from './stage'
+import type { AgyAccountQuota, AgyEffort, AgyHealth, AgyLaunch, AgyMode, AgyModel, AgyPoolQuota, AgyQuota, AgyRotation, AgyRun, AgySettings, AgyStep, AgyUsage } from '../types'
 
 const PANE = 'agy'
 const TOOL = 'run'
-const FULL_TOOL = 'mcp__agy-bridge__run'
+const FULL_TOOL = 'mcp__agy4claude__run'
 const MAX_RUNS = 20
 const MAX_TEXT = 20_000
 const MAX_STDERR = 4_000
@@ -14,9 +16,26 @@ const EFFORTS: readonly AgyEffort[] = ['low', 'medium', 'high', 'xhigh', 'max']
 const MODES: readonly AgyMode[] = ['plan', 'accept-edits']
 
 // `$.state` refs: plugin and key are literals, as the validator asks.
-const RUNS = { plugin: 'agy-bridge', key: 'runs' } as const
-const LAST = { plugin: 'agy-bridge', key: 'lastConversation' } as const
-const HEALTH = { plugin: 'agy-bridge', key: 'health' } as const
+const RUNS = { plugin: 'agy4claude', key: 'runs' } as const
+const LAST = { plugin: 'agy4claude', key: 'lastConversation' } as const
+const HEALTH = { plugin: 'agy4claude', key: 'health' } as const
+const QUOTA = { plugin: 'agy4claude', key: 'quota' } as const
+const MODELS = { plugin: 'agy4claude', key: 'models' } as const
+const SETTINGS_OPEN = { plugin: 'agy4claude', key: 'settingsOpen' } as const
+const EXPANDED = { plugin: 'agy4claude', key: 'expanded' } as const
+const expandedRuns = atom(EXPANDED, [] as string[])
+/** A reply longer than this many lines (or characters) is folded behind a "show all" button. */
+const FOLD_LINES = 10
+const FOLD_CHARS = 700
+const frame = atom({ plugin: 'agy4claude', key: 'frame' } as const, 0)
+/** Stage frames a second while agy runs (and briefly after); idle, the robot drifts at a quarter of that. */
+const FPS = 8
+
+const MAIN = 'main'
+/** How long a quota reading is trusted when picking a sign-in. */
+const QUOTA_FRESH_MS = 60_000
+/** What agy says when a sign-in has run out: the run is retried once on the next sign-in. */
+const QUOTA_ERROR = /quota|exhausted|rate.?limit|\b429\b|limit (?:reached|exceeded)/i
 
 type Options = {
   agy_path: string
@@ -24,11 +43,19 @@ type Options = {
   model: string
   effort: AgyEffort | ''
   agent: string
+  profiles_dir: string
+  account_order: string
+  rotation: AgyRotation
+  language: 'auto' | 'en' | 'zh-TW'
+  min_quota: number
+  claude_price_in: number
+  claude_price_out: number
   sandbox: boolean
 }
 
 type RunInput = {
   prompt?: string
+  account?: string
   cwd?: string
   continue_conversation?: boolean
   conversation?: string
@@ -80,7 +107,8 @@ type StreamEvent = {
 
 type Active = {
   job: string
-  stream: HookStream<ProcessSpawnChunk, ProcessSpawnResult>
+  /** Absent while the run is still picking a sign-in. */
+  stream: HookStream<ProcessSpawnChunk, ProcessSpawnResult> | null
   cancelled: boolean
 }
 
@@ -92,6 +120,24 @@ const asEffort = (value: unknown): AgyEffort | '' => {
 const asMode = (value: unknown): AgyMode | '' => {
   const text = String(value ?? '').trim().toLowerCase().replace('_', '-')
   return (MODES as readonly string[]).includes(text) ? (text as AgyMode) : ''
+}
+
+const ROTATIONS: readonly AgyRotation[] = ['ordered', 'round-robin', 'random', 'most-left']
+const asRotation = (value: unknown): AgyRotation => {
+  const text = String(value ?? '').trim().toLowerCase()
+  return (ROTATIONS as readonly string[]).includes(text) ? (text as AgyRotation) : 'ordered'
+}
+
+type Lang = 'en' | 'zh-TW'
+const LANGS: readonly ('auto' | Lang)[] = ['auto', 'en', 'zh-TW']
+const asLanguage = (value: unknown): 'auto' | Lang => {
+  const text = String(value ?? '').trim()
+  return (LANGS as readonly string[]).includes(text) ? (text as 'auto' | Lang) : 'auto'
+}
+
+const asPrice = (value: unknown, fallback: number): number => {
+  const n = Number(value)
+  return String(value ?? '').trim() !== '' && Number.isFinite(n) && n >= 0 ? n : fallback
 }
 
 const asBool = (value: unknown): boolean => value === true || String(value ?? '').trim().toLowerCase() === 'true'
@@ -107,6 +153,13 @@ const readOptions = (options: Record<string, unknown>): Options => ({
   model: String(options.model ?? '').trim(),
   effort: asEffort(options.effort),
   agent: String(options.agent ?? '').trim(),
+  profiles_dir: String(options.profiles_dir ?? '').trim(),
+  account_order: String(options.account_order ?? '').trim(),
+  rotation: asRotation(options.rotation),
+  language: asLanguage(options.language),
+  min_quota: Number.isFinite(Number(options.min_quota)) && String(options.min_quota ?? '').trim() !== '' ? Number(options.min_quota) : 5,
+  claude_price_in: asPrice(options.claude_price_in, 4),
+  claude_price_out: asPrice(options.claude_price_out, 20),
   sandbox: asBool(options.sandbox),
 })
 
@@ -205,12 +258,15 @@ let agyExe = 'agy'
 let active: Active | null = null
 /** Redraws the pane each second while a run is live, so its clock moves. */
 let ticker: Timer | null = null
+/** When an SVG stage was last drawn, and the runs it drew: the stage clock runs only while one is in view. */
+let stageSeenAt = 0
+let lastRuns: AgyRun[] = []
 
 const cancelActive = async (): Promise<string | null> => {
   if (!active) return null
   const stopping = active
   stopping.cancelled = true
-  await stopping.stream.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
+  await stopping.stream?.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
   return stopping.job
 }
 
@@ -270,6 +326,184 @@ const checkAgy = async ($: EngineInterface): Promise<AgyHealth> => {
   }
 }
 
+// ---- sign-ins (accounts) --------------------------------------------------
+// agy keeps its sign-in under HOME, so another HOME is another Google account with its own quota.
+// `main` is the real HOME; each subfolder of profiles_dir (default ~/.agy-profiles) is one more.
+
+const homeOf = async ($: EngineInterface): Promise<string> =>
+  (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? ''
+
+const profilesDirOf = async ($: EngineInterface): Promise<string> => {
+  if (options.profiles_dir) return options.profiles_dir
+  const home = await homeOf($)
+  return home ? `${home}/.agy-profiles` : ''
+}
+
+/** The profile folders that exist, by name. */
+const profilesOf = async ($: EngineInterface): Promise<string[]> => {
+  const dir = await profilesDirOf($)
+  if (!dir) return []
+  try {
+    return (await $.fs.list(dir))
+      .filter(one => one.kind !== 'file' && !one.name.startsWith('.') && one.name !== MAIN)
+      .map(one => one.name)
+      .sort()
+  } catch {
+    return []
+  }
+}
+
+/** Every sign-in runs may use, in order: account_order when set (unknown names dropped), else the profiles by name, then main. */
+const accountsOf = async ($: EngineInterface): Promise<string[]> => {
+  const profiles = await profilesOf($)
+  const order = options.account_order.split(',').map(one => one.trim()).filter(Boolean)
+  if (order.length) {
+    const known = order.filter((name, i) => order.indexOf(name) === i && (name === MAIN || profiles.includes(name)))
+    if (known.length) return known
+  }
+  return [...profiles, MAIN]
+}
+
+/** The env a run of this sign-in gets: nothing for `main`, the home folder pointed at the profile otherwise. */
+const envFor = async ($: EngineInterface, account: string): Promise<Record<string, string> | undefined> => {
+  if (account === MAIN) return undefined
+  const home = `${await profilesDirOf($)}/${account}`
+  return (await $.env.get('USERPROFILE')) ? { HOME: home, USERPROFILE: home } : { HOME: home }
+}
+
+/** Gemini models draw on one quota pool; Claude and GPT models in agy on another. */
+const poolOf = (model: string): 'gemini' | 'other' => (/^(claude|gpt)/i.test(model) ? 'other' : 'gemini')
+
+const POOL_ROWS = { gemini: 'Gemini Models', other: 'Claude and GPT models' } as const
+
+/** Reads `agy -p /usage` for one sign-in: TSV rows of `<pool>  <window>  <NN%>  <reset time>`. */
+const readQuota = async ($: EngineInterface, account: string): Promise<AgyAccountQuota> => {
+  const unread: AgyAccountQuota = { name: account, gemini: { left: -1 }, other: { left: -1 } }
+  const env = await envFor($, account)
+  try {
+    const ran = await $.process.run([agyExe, '-p', '/usage', '--print-timeout', '30s'], {
+      ...(env ? { env, cwd: env.HOME } : { cwd: (await homeOf($)) || undefined }),
+      timeoutMs: 45_000,
+    })
+    const rows = ran.stdout.split('\n').map(row => row.split('\t'))
+    const pool = (label: string): AgyPoolQuota => {
+      let best: AgyPoolQuota = { left: -1 }
+      for (const cols of rows) {
+        if (cols[0] !== label) continue
+        const left = Number.parseInt(cols[2] ?? '', 10)
+        if (!Number.isFinite(left)) continue
+        if (best.left < 0 || left < best.left) best = { left, ...(cols[3]?.trim() ? { resetAt: cols[3].trim() } : {}) }
+      }
+      return best
+    }
+    return { name: account, gemini: pool(POOL_ROWS.gemini), other: pool(POOL_ROWS.other) }
+  } catch {
+    return unread
+  }
+}
+
+/** Reads every sign-in's quota at once and keeps it for the pane. */
+const checkQuota = async ($: EngineInterface): Promise<AgyQuota> => {
+  const accounts = await Promise.all((await accountsOf($)).map(name => readQuota($, name)))
+  const quota: AgyQuota = { accounts, checkedAt: Date.now() }
+  await $.state.set(QUOTA, quota)
+  return quota
+}
+
+const fmtLeft = (left: number): string => (left < 0 ? '?' : `${left}%`)
+
+const fmtQuota = (quota: AgyQuota, pool: 'gemini' | 'other' = 'gemini'): string =>
+  quota.accounts.map(one => `${one.name} ${fmtLeft(one[pool].left)}`).join(' · ')
+
+/**
+ * The sign-in a run uses, by the rotation setting, among those whose pool for the model has more
+ * than min_quota left. With one sign-in there is nothing to choose and no quota is read. When no
+ * quota could be read at all, the first is tried rather than refusing. `skip` leaves out sign-ins
+ * already tried this run.
+ */
+const pickAccount = async ($: EngineInterface, model: string, skip: string[] = []): Promise<{ account: string } | { error: string }> => {
+  const all = await accountsOf($)
+  const candidates = all.filter(name => !skip.includes(name))
+  if (candidates.length === 0) return { error: 'every agy sign-in has been tried' }
+  if (all.length === 1) return { account: candidates[0]! }
+  const pool = poolOf(model)
+  const { value: cached = null } = await $.state.get(QUOTA)
+  const fresh = cached && Date.now() - cached.checkedAt < QUOTA_FRESH_MS && all.every(name => cached.accounts.some(a => a.name === name))
+  const quota = fresh ? cached! : await checkQuota($)
+  const left = (name: string) => quota.accounts.find(a => a.name === name)?.[pool].left ?? -1
+  const usable = candidates.filter(name => left(name) > options.min_quota)
+  if (usable.length === 0) {
+    // Nothing clears the bar: try one whose quota could not be read before refusing.
+    const unknown = candidates.find(name => left(name) < 0)
+    if (unknown) return { account: unknown }
+    return { error: `every agy sign-in is out of ${pool === 'gemini' ? 'Gemini' : 'Claude/GPT'} quota (${fmtQuota(quota, pool)}); /agy usage shows when they reset` }
+  }
+  const { rotation } = await settingsOf($)
+  if (rotation === 'random') return { account: usable[Math.floor(Math.random() * usable.length)]! }
+  if (rotation === 'most-left') return { account: [...usable].sort((x, y) => left(y) - left(x))[0]! }
+  if (rotation === 'round-robin') {
+    const last = String((await $.store.get('lastAccount')) ?? '')
+    const after = all.indexOf(last)
+    const next = [...all.slice(after + 1), ...all.slice(0, after + 1)].find(name => usable.includes(name))
+    return { account: next ?? usable[0]! }
+  }
+  return { account: usable[0]! }
+}
+
+/** Marks a sign-in's pool as spent after agy reported it out of quota, so the next pick skips it. */
+const markSpent = async ($: EngineInterface, account: string, model: string) => {
+  const { value: quota = null } = await $.state.get(QUOTA)
+  if (!quota) return
+  const pool = poolOf(model)
+  await $.state.set(QUOTA, { ...quota, accounts: quota.accounts.map(a => (a.name === account ? { ...a, [pool]: { ...a[pool], left: 0 } } : a)) })
+}
+
+// ---- settings ------------------------------------------------------------
+// The pane's pickers write model, effort and rotation to the plugin's store, over the plugin
+// options; a tool call's own model or effort wins over both.
+
+const settingsOf = async ($: EngineInterface): Promise<AgySettings> => {
+  const saved = ((await $.store.get('settings')) ?? {}) as Partial<AgySettings>
+  return {
+    model: typeof saved.model === 'string' ? saved.model : options.model,
+    effort: saved.effort !== undefined ? asEffort(saved.effort) : options.effort,
+    rotation: saved.rotation !== undefined ? asRotation(saved.rotation) : options.rotation,
+    language: saved.language !== undefined ? asLanguage(saved.language) : options.language,
+  }
+}
+
+const saveSetting = async ($: EngineInterface, change: Partial<AgySettings>) => {
+  const saved = ((await $.store.get('settings')) ?? {}) as Partial<AgySettings>
+  await $.store.set('settings', { ...saved, ...change })
+  $.ui.invalidate('ui.render')
+}
+
+/** `agy models`: one `<slug>\t<label>` per line after a header. */
+const loadModels = async ($: EngineInterface): Promise<AgyModel[]> => {
+  try {
+    const ran = await $.process.run([agyExe, 'models'], { timeoutMs: 30_000 })
+    return ran.stdout.split('\n').map(row => row.split('\t')).filter(cols => cols.length >= 2 && cols[0]!.trim())
+      .map(cols => ({ value: cols[0]!.trim(), label: cols[1]!.trim() }))
+  } catch {
+    return []
+  }
+}
+
+/** Lets git inside a profile's HOME find the user's own git settings. */
+const shareGitConfig = async ($: EngineInterface, account: string) => {
+  if (account === MAIN) return
+  const home = await homeOf($)
+  const env = await envFor($, account)
+  if (!home || !env) return
+  try {
+    if ((await $.fs.exists(`${home}/.gitconfig`)) && !(await $.fs.exists(`${env.HOME}/.gitconfig`))) {
+      await $.process.run(['ln', '-s', `${home}/.gitconfig`, `${env.HOME}/.gitconfig`])
+    }
+  } catch {
+    // Best effort: a run without the user's git settings still runs.
+  }
+}
+
 /** The exact agy command a run is. `-p` goes last: it takes the next token as the prompt. */
 const argvFor = (p: AgyLaunch & { prompt: string; conversation: string | null; timeout: string; jsonSchema: string }): string[] => [
   agyExe,
@@ -306,6 +540,7 @@ const summarize = (run: AgyRun, stderr: string): string => {
   const toolsUsed = [...new Set(run.steps.filter(s => s.type === 'tool').map(s => s.tool).filter(Boolean))]
   const header = [
     `agy ${run.status} in ${seconds}s`,
+    `account ${run.account}`,
     run.conversation ? `conversation ${run.conversation}` : null,
     ...launchTags(run),
     toolsUsed.length ? `tools: ${toolsUsed.join(', ')}` : null,
@@ -315,6 +550,93 @@ const summarize = (run: AgyRun, stderr: string): string => {
   const extra = stderr && !(run.error ?? '').includes(stderr.slice(0, 20)) ? `\nstderr: ${oneLine(stderr, 500)}` : ''
   const tail = run.error ? `\n\nERROR: ${run.error}${extra}` : ''
   return `${header}\n\n${body}${tail}`
+}
+
+// ---- language ------------------------------------------------------------
+// The pane and the /agy replies speak the viewer's language; the tool result stays English for the model.
+
+const STRINGS = {
+  en: {
+    subtitle: 'Gemini sub-agent', checking: 'checking agy…', runs: (n: number) => `${n} run${n === 1 ? '' : 's'}`,
+    model: 'Model', effort: 'Effort', rotation: 'Rotation', language: 'Language', agyDefault: 'agy default',
+    rot: { ordered: 'Ordered · first with quota', 'round-robin': 'Round-robin · next each run', random: 'Random', 'most-left': 'Most quota left' },
+    rotShort: { ordered: 'ordered', 'round-robin': 'round-robin', random: 'random', 'most-left': 'most left' },
+    langAuto: 'Auto', langShort: { auto: 'auto', en: 'English', 'zh-TW': '繁中' },
+    settings: 'Settings', close: 'Close', saved: 'Saved', today: (v: string) => `today +${v}`, savedAbout: (v: string) => `saved ~${v}`,
+    status: { done: 'Done', error: 'Error', cancelled: 'Cancelled', running: 'Running', starting: 'Starting', idle: 'Standing by', sleeping: 'Out of quota' },
+    onAccount: (a: string) => `account ${a}`, step: (n: number, what: string) => `step ${n} · ${what}`, toolsTokens: (n: number, tk: string) => `${n} tool call${n === 1 ? '' : 's'} · ${tk} tokens`,
+    activity: 'Activity', noTools: 'No tool calls', noToolsYet: 'No tool calls yet', toolCalls: (n: number) => `${n} tool call${n === 1 ? '' : 's'}`,
+    earlier: (n: number) => `${n} earlier`, waiting: 'Working on it…', noOutput: '(no output)',
+    phase: { 'checking quota': 'Checking quota…', 'starting agy': 'Starting agy…', thinking: 'Thinking…', writing: 'Writing the answer…' } as Record<string, string>,
+    cancel: 'Cancel', history: 'History', showAll: 'Show the whole answer', showLess: 'Show less', claudeAsks: 'Claude asks', claudeFollows: 'Claude follows up', agentReplies: 'Gemini replies',
+    emptyTitle: 'Hand work to Gemini', emptyBody: 'Ask Claude to delegate a task to agy, or type /agy <prompt>. The conversation, tool calls and answer show here.',
+    justNow: 'just now', minAgo: (n: number) => `${n}m ago`, hourAgo: (n: number) => `${n}h ago`, dayAgo: (n: number) => `${n}d ago`,
+    opened: 'Antigravity pane opened.', cancelled: (job: string) => `agy: cancelled job ${job}.`, nothingRunning: 'agy: nothing is running.',
+    usageHead: 'agy sign-ins, in the order runs use them:', unreadable: 'quota unreadable (signed in?)', resets: 'resets',
+    accountsHead: (rot: string) => `agy sign-ins, in order (rotation: ${rot}):`, ownSignIn: '(your own agy sign-in)', addHint: 'Add one: /agy accounts add <name>',
+    addUsage: 'Usage: /agy accounts add <name> (letters, digits, - or _; not "main")', noHome: 'agy4claude: no home folder to keep sign-ins in; set profiles_dir in the plugin options.',
+    created: (path: string) => `Created ${path}. Sign it in once from a terminal (it opens a Google sign-in), then /exit:`,
+    joins: (ordered: boolean) => `It joins the rotation by itself${ordered ? ' once you add it to account_order' : ''}; /agy usage checks it.`,
+  },
+  'zh-TW': {
+    subtitle: 'Gemini 子代理', checking: '正在檢查 agy…', runs: (n: number) => `${n} 次`,
+    model: '模型', effort: '思考程度', rotation: '輪替', language: '語言', agyDefault: 'agy 預設',
+    rot: { ordered: '依序 · 第一個有額度的', 'round-robin': '輪流 · 每次換下一個', random: '隨機', 'most-left': '剩最多的' },
+    rotShort: { ordered: '依序輪替', 'round-robin': '輪流', random: '隨機', 'most-left': '剩最多優先' },
+    langAuto: '自動', langShort: { auto: '自動', en: 'English', 'zh-TW': '繁中' },
+    settings: '設定', close: '收起', saved: '累積節省', today: (v: string) => `今天 +${v}`, savedAbout: (v: string) => `省約 ${v}`,
+    status: { done: '完成', error: '錯誤', cancelled: '已取消', running: '執行中', starting: '啟動中', idle: '待命', sleeping: '額度用完' },
+    onAccount: (a: string) => `帳號 ${a}`, step: (n: number, what: string) => `第 ${n} 步 · ${what}`, toolsTokens: (n: number, tk: string) => `${n} 次工具呼叫 · ${tk} tokens`,
+    activity: '過程', noTools: '沒有呼叫工具', noToolsYet: '尚未呼叫工具', toolCalls: (n: number) => `${n} 次工具呼叫`,
+    earlier: (n: number) => `前面還有 ${n} 筆`, waiting: '正在處理…', noOutput: '(沒有輸出)',
+    phase: { 'checking quota': '正在查各帳號額度…', 'starting agy': '正在啟動 agy…', thinking: '思考中…', writing: '正在整理答案…' } as Record<string, string>,
+    cancel: '取消', history: '紀錄', showAll: '看完整回答', showLess: '收起', claudeAsks: 'Claude 交辦', claudeFollows: 'Claude 接著問', agentReplies: 'Gemini 回報',
+    emptyTitle: '把工作交給 Gemini', emptyBody: '請 Claude 把任務交給 agy,或輸入 /agy <題目>。對話、工具呼叫與答案都會顯示在這裡。',
+    justNow: '剛剛', minAgo: (n: number) => `${n} 分鐘前`, hourAgo: (n: number) => `${n} 小時前`, dayAgo: (n: number) => `${n} 天前`,
+    opened: '已開啟 Antigravity 面板。', cancelled: (job: string) => `agy:已取消 ${job}。`, nothingRunning: 'agy:目前沒有執行中的任務。',
+    usageHead: 'agy 帳號(依使用順序):', unreadable: '讀不到額度(登入了嗎?)', resets: '重置於',
+    accountsHead: (rot: string) => `agy 帳號(依序，輪替方式:${rot}):`, ownSignIn: '(你本來的 agy 登入)', addHint: '新增：/agy accounts add <名稱>',
+    addUsage: '用法:/agy accounts add <名稱>(英數、- 或 _;不能叫 main)', noHome: 'agy4claude:找不到家目錄存放帳號，請在插件選項設定 profiles_dir。',
+    created: (path: string) => `已建立 ${path}。請在終端機登入一次(會開 Google 登入頁),完成後 /exit:`,
+    joins: (ordered: boolean) => `${ordered ? '把它加進 account_order 後' : ''}就會自動加入輪替;/agy usage 可以確認。`,
+  },
+} as const
+
+type Strings = (typeof STRINGS)['en'] | (typeof STRINGS)['zh-TW']
+
+const langOf = async ($: EngineInterface): Promise<Lang> => {
+  const { language } = await settingsOf($)
+  if (language !== 'auto') return language
+  const env = `${(await $.env.get('LC_ALL')) ?? ''} ${(await $.env.get('LANG')) ?? ''}`
+  return /zh/i.test(env) ? 'zh-TW' : 'en'
+}
+
+const stringsOf = async ($: EngineInterface): Promise<Strings> => STRINGS[await langOf($)]
+
+// ---- savings: what delegated runs would have cost on Claude, kept across sessions ----
+
+type Savings = { total: number; days: Record<string, number> }
+
+/** The local calendar day, so "today" turns over at the viewer's midnight. */
+const dayKey = (at: number): string => {
+  const d = new Date(at)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+const savingsOf = async ($: EngineInterface): Promise<Savings> => {
+  const raw = (await $.store.get('savings')) as Partial<Savings> | undefined
+  return { total: Number(raw?.total) || 0, days: raw?.days && typeof raw.days === 'object' ? raw.days : {} }
+}
+
+const addSavings = async ($: EngineInterface, usd: number) => {
+  if (!(usd > 0)) return
+  const now = await $.clock.now()
+  const s = await savingsOf($)
+  const key = dayKey(now)
+  const days: Record<string, number> = { ...s.days, [key]: (s.days[key] ?? 0) + usd }
+  // Keep a month of days; the total keeps everything.
+  for (const old of Object.keys(days).sort().slice(0, -31)) delete days[old]
+  await $.store.set('savings', { total: s.total + usd, days })
 }
 
 // ---- pane formatting ------------------------------------------------------
@@ -329,27 +651,38 @@ const fmtElapsed = (ms: number): string => {
   return `${s}s`
 }
 
-const fmtAgo = (at: number): string => {
+const fmtAgo = (at: number, t: Strings = STRINGS.en): string => {
   const minutes = Math.round((Date.now() - at) / 60_000)
-  if (minutes < 1) return 'just now'
-  if (minutes < 60) return `${minutes}m ago`
+  if (minutes < 1) return t.justNow
+  if (minutes < 60) return t.minAgo(minutes)
   const hours = Math.round(minutes / 60)
-  return hours < 24 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`
+  return hours < 24 ? t.hourAgo(hours) : t.dayAgo(Math.round(hours / 24))
 }
 
 const fmtTokens = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n))
 
-const shortId = (id: string | null): string => (id ? id.split('-')[0] : '')
+const shortId = (id: string | null): string => (id ? id.split('-')[0]! : '')
 
 const isLive = (run: AgyRun): boolean => run.status === 'running' || run.status === 'starting'
 
-const statusLook = (run: AgyRun): { icon: string; label: string; color: 'claude' | 'success' | 'error' | 'inactive' } => {
-  switch (run.status) {
-    case 'done': return { icon: '✓', label: 'DONE', color: 'success' }
-    case 'error': return { icon: '✗', label: 'ERROR', color: 'error' }
-    case 'cancelled': return { icon: '■', label: 'CANCELLED', color: 'inactive' }
-    default: return { icon: '●', label: 'RUNNING', color: 'claude' }
+type Tone = 'claude' | 'success' | 'error' | 'inactive'
+
+const statusLook = (run: AgyRun | undefined, t: Strings = STRINGS.en): { icon: string; label: string; color: Tone } => {
+  switch (run?.status) {
+    case undefined: return { icon: '○', label: t.status.idle, color: 'inactive' }
+    case 'done': return { icon: '✓', label: t.status.done, color: 'success' }
+    case 'error': return { icon: '✕', label: t.status.error, color: 'error' }
+    case 'cancelled': return { icon: '■', label: t.status.cancelled, color: 'inactive' }
+    case 'starting': return { icon: '◌', label: t.status.starting, color: 'claude' }
+    default: return { icon: '●', label: t.status.running, color: 'claude' }
   }
+}
+
+/** The terminal's quota meter: ten cells. */
+const meterText = (left: number): string => {
+  if (left < 0) return '··········'
+  const full = Math.round(Math.max(0, Math.min(100, left)) / 10)
+  return `${'█'.repeat(full)}${'░'.repeat(10 - full)}`
 }
 
 const DELEGATION_GUIDE =
@@ -360,110 +693,108 @@ const DELEGATION_GUIDE =
   'Write the prompt as a complete instruction with the paths it needs; it runs with permissions bypassed in the given working directory. ' +
   'Use mode "plan" when only a plan or review is wanted and nothing should change; "accept-edits" when it may edit files but should not run commands. ' +
   'Use json_schema when you will parse its answer. ' +
+  'Besides files and commands, agy has its own tools for the web: search_web (Google search), read_url_content (reads a page) and a full browser ' +
+  '(open, click, type, scroll, screenshot, run JavaScript), so web research, reading long pages and checking a site can be delegated too. ' +
+  'search_web returns Google redirect links (vertexaisearch.cloud.google.com/grounding-api-redirect/...) and bare domain names, not the real sources: ' +
+  'when sources matter, tell agy to open each result with read_url_content and report the final page title and real URL, and spot-check a few yourself. ' +
+  'For facts that must be current (latest versions, prices, release dates), verify them yourself rather than trusting the answer alone. ' +
   'Its final answer comes back as the tool result (live progress is in the Antigravity pane). ' +
+  'It rotates through the user\'s agy sign-ins (separate Google accounts), using the first with Gemini quota left; leave account empty unless the user names one. ' +
   'Pass continue_conversation: true to follow up on its last run. Tell the user what you delegated and summarize what agy did.'
 
-export const register: Register = (on, rawOptions) => {
-  options = readOptions(rawOptions as Record<string, unknown>)
-  agyExe = options.agy_path
+/** One delegated task: picks a sign-in, runs agy, retries once on an exhausted quota, keeps the pane's record. */
+/**
+ * agy links local files as [label](file:///long/path), which the pane cannot open and which draw the whole
+ * path, wider than the bubble: keep the label alone (or the file name for a bare file URL).
+ */
+const tidyReply = (text: string): string =>
+  text
+    .replace(/\[([^\]]+)\]\(file:\/\/[^)\s]+\)/g, '$1')
+    .replace(/(?<![(\w])file:\/\/\S*\/([^/\s)#]+)(#\S*)?/g, '`$1`')
 
-  on('session.start', async ($, e, next) => {
-    await $.tool.register({
-      name: TOOL,
-      description:
-        'Delegate a coding task to Antigravity CLI (agy) on this machine, like a sub-agent. ' +
-        'agy runs with permissions bypassed in the given working directory (the session directory by default) and returns its final answer. ' +
-        'Live progress is shown in the Antigravity pane. Set continue_conversation to follow up on the previous agy run.',
-      isDeferred: false,
-      inputSchema: {
-        type: 'object',
-        properties: {
-          prompt: { type: 'string', description: 'The task for agy, written as a complete instruction.' },
-          cwd: { type: 'string', description: 'Working directory for agy. Defaults to the configured default_cwd, else the session directory.' },
-          continue_conversation: { type: 'boolean', description: 'Continue the most recent agy conversation started from this session.' },
-          conversation: { type: 'string', description: 'An explicit agy conversation id to resume.' },
-          model: { type: 'string', description: 'agy --model slug; empty uses the configured default.' },
-          effort: { type: 'string', enum: [...EFFORTS], description: 'Reasoning effort for this run; empty uses the configured default.' },
-          mode: { type: 'string', enum: [...MODES], description: '"plan": agy only plans, changes nothing. "accept-edits": agy may edit files but not run commands. Empty: full access.' },
-          agent: { type: 'string', description: 'Name of an agent defined in agy (see `agy agents`) to run the task with.' },
-          project: { type: 'string', description: 'agy project id or name for this run.' },
-          add_dirs: { type: 'array', items: { type: 'string' }, description: 'Extra directories agy may read and edit besides cwd.' },
-          json_schema: { type: 'string', description: 'A JSON schema (as JSON text, or a path to a schema file) the final answer must conform to.' },
-          sandbox: { type: 'boolean', description: 'Run agy in its sandbox with terminal restrictions.' },
-          timeout_minutes: { type: 'number', description: `Maximum minutes to wait for agy (default ${DEFAULT_MINUTES}, at most 60).` },
-        },
-        required: ['prompt'],
-      },
-    })
-    await $.command.register({
-      name: 'agy',
-      description: 'Antigravity: /agy opens the pane and checks agy, /agy <prompt> runs agy, /agy cancel stops the current run',
-    })
-    const started = await next(e)
-    void $.ui.open({ id: PANE, title: 'Antigravity' })
-    void checkAgy($).then(health => $.state.set(HEALTH, health)).catch(() => undefined)
-    return started
-  })
+const newJob = (): string => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
 
-  on('prompt.compose', async ($, e, next) => {
-    const composed = await next(e)
-    if (!e.tools.includes(FULL_TOOL)) return composed
-    return { sections: [...composed.sections, { id: 'agy-bridge:delegate', text: DELEGATION_GUIDE, scope: 'session' }] }
-  })
+/** Writes one run's record; every write re-reads the list, so no other record is dropped. */
+async function saveRun($: EngineInterface, run: AgyRun) {
+  const { value: known = [] } = await $.state.get(RUNS)
+  const list = known.some(one => one.job === run.job) ? replaceRun(known, run) : [...known, run].slice(-MAX_RUNS)
+  await $.state.set(RUNS, list)
+}
 
-  on('tool.call', { tool: FULL_TOOL }, async ($, e, next) => {
-    const input = e as unknown as RunInput
-    const prompt = String(input.prompt ?? '').trim()
-    if (!prompt) return { result: 'agy-bridge: prompt is required.' }
-    if (active) return { result: `agy-bridge: an agy run is already in progress (job ${active.job}). Wait for it, or stop it with /agy cancel.` }
-    if (input.effort !== undefined && String(input.effort).trim() && !asEffort(input.effort)) {
-      return { result: `agy-bridge: effort must be one of ${EFFORTS.join(', ')}.` }
+async function runTask($: EngineInterface, input: RunInput, prompt: string, next: { signal: { aborted: boolean } }, claim: Active) {
+  const cwd = String(input.cwd ?? '').trim() || options.default_cwd
+  const { value: previous = null } = await $.state.get(LAST)
+  const conversation = input.conversation ?? (input.continue_conversation ? previous : null) ?? null
+  const jsonSchema = String(input.json_schema ?? '').trim()
+  const settings = await settingsOf($)
+  const launch: AgyLaunch = {
+    model: String(input.model ?? '').trim() || settings.model,
+    effort: asEffort(input.effort) || settings.effort,
+    mode: asMode(input.mode),
+    agent: String(input.agent ?? '').trim() || options.agent,
+    project: String(input.project ?? '').trim(),
+    addDirs: asDirs(input.add_dirs),
+    sandbox: input.sandbox === undefined ? options.sandbox : asBool(input.sandbox),
+    structured: jsonSchema !== '',
+  }
+  const minutes = Math.max(1, Math.min(60, Math.round(Number(input.timeout_minutes) || DEFAULT_MINUTES)))
+  const timeout = `${minutes}m`
+  // A conversation lives in the sign-in that started it, so a follow-up stays there.
+  const { value: pastRuns = [] } = await $.state.get(RUNS)
+  const sticky = conversation ? pastRuns.find(one => one.conversation === conversation)?.account : undefined
+  const askedAccount = String(input.account ?? '').trim() || sticky || ''
+  if (askedAccount && !(await accountsOf($)).includes(askedAccount)) {
+    return { result: `agy4claude: no agy sign-in named "${askedAccount}" (have: ${(await accountsOf($)).join(', ')}).` }
+  }
+  void $.ui.open({ id: PANE, title: 'Antigravity' })
+
+  // One attempt per sign-in: a run that dies of an exhausted quota is tried once more on the next one.
+  const tried: string[] = []
+  // The pane shows the run at once, while the sign-in is still being picked (reading quota can take a while).
+  const firstJob = newJob()
+  const handedAt = Date.now()
+  let current: AgyRun = {
+    ...launch,
+    job: firstJob, account: askedAccount, prompt, cwd, conversation, status: 'starting', phase: 'checking quota', startedAt: handedAt, steps: [], text: '',
+  }
+  await saveRun($, current)
+  let stderr = ''
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const picked = askedAccount ? { account: askedAccount } : await pickAccount($, launch.model, tried)
+    if ('error' in picked) {
+      if (attempt === 0) {
+        await saveRun($, { ...current, status: 'error', phase: undefined, error: picked.error, endedAt: Date.now() })
+        return { result: `agy4claude: ${picked.error}` }
+      }
+      break
     }
-    if (input.mode !== undefined && String(input.mode).trim() && !asMode(input.mode)) {
-      return { result: `agy-bridge: mode must be one of ${MODES.join(', ')}.` }
-    }
+    const account = picked.account
+    tried.push(account)
+    await $.store.set('lastAccount', account)
+    await shareGitConfig($, account)
+    const env = await envFor($, account)
+    stderr = ''
+    const job = attempt === 0 ? firstJob : newJob()
 
-    const cwd = String(input.cwd ?? '').trim() || options.default_cwd
-    const { value: previous = null } = await $.state.get(LAST)
-    const conversation = input.conversation ?? (input.continue_conversation ? previous : null) ?? null
-    const jsonSchema = String(input.json_schema ?? '').trim()
-    const launch: AgyLaunch = {
-      model: String(input.model ?? '').trim() || options.model,
-      effort: asEffort(input.effort) || options.effort,
-      mode: asMode(input.mode),
-      agent: String(input.agent ?? '').trim() || options.agent,
-      project: String(input.project ?? '').trim(),
-      addDirs: asDirs(input.add_dirs),
-      sandbox: input.sandbox === undefined ? options.sandbox : asBool(input.sandbox),
-      structured: jsonSchema !== '',
-    }
-    const minutes = Math.max(1, Math.min(60, Math.round(Number(input.timeout_minutes) || DEFAULT_MINUTES)))
-    const timeout = `${minutes}m`
-    const job = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
-
-    let current: AgyRun = {
+    current = {
       ...launch,
-      job, prompt, cwd, conversation, status: 'starting', phase: 'starting agy', startedAt: Date.now(), steps: [], text: '',
+      job, account, prompt, cwd, conversation, status: 'starting', phase: 'starting agy', startedAt: handedAt, steps: [], text: '',
     }
-    const { value: known = [] } = await $.state.get(RUNS)
-    let list: AgyRun[] = [...known, current].slice(-MAX_RUNS)
-    const save = async () => {
-      list = replaceRun(list, current)
-      await $.state.set(RUNS, list)
-    }
-    await $.state.set(RUNS, list)
+    const save = () => saveRun($, current)
+    await save()
     $.ui.status('agy: running')
 
     const argv = argvFor({ ...launch, prompt, conversation, timeout, jsonSchema })
-    const stream = $.process.spawn({ argv, ...(cwd ? { cwd } : {}) })
-    const me: Active = { job, stream, cancelled: false }
-    active = me
+    const stream = $.process.spawn({ argv, ...(cwd ? { cwd } : {}), ...(env ? { env } : {}) })
+    const me = claim
+    me.job = job
+    me.stream = stream
+    if (me.cancelled) await stream.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
     ticker?.cancel()
     ticker = $.clock.every(1000, () => $.ui.invalidate('ui.render'))
 
     // agy's own --print-timeout is the real limit; this only catches a hung child that keeps writing.
     const deadline = Date.now() + (minutes + 1) * 60_000
-    let stderr = ''
     let buffer = ''
     let ended: ProcessSpawnResult | undefined
     try {
@@ -505,7 +836,6 @@ export const register: Register = (on, rawOptions) => {
         current = { ...current, status: 'error', error: `agy output stream lost: ${message}`, endedAt: Date.now() }
       }
     } finally {
-      if (active === me) active = null
       ticker?.cancel()
       ticker = null
       $.ui.status(undefined)
@@ -527,23 +857,156 @@ export const register: Register = (on, rawOptions) => {
       }
     }
     current = { ...current, phase: undefined, endedAt: current.endedAt ?? Date.now() }
+    if (current.status === 'done' && current.usage) {
+      current = { ...current, savedUsd: savedUsd(current.usage, options.claude_price_in, options.claude_price_out) }
+    }
     await save()
 
-    if (current.conversation) await $.state.set(LAST, current.conversation)
-    return { result: summarize(current, stderr) }
+    // Retry on the next sign-in only when agy failed before doing anything: a run that already
+    // edited files or ran commands must not run again from the start.
+    const untouched = current.steps.length === 0 && !current.text.trim() && !(current.response ?? '').trim()
+    const spent = untouched && current.status === 'error' && QUOTA_ERROR.test(`${current.error ?? ''} ${stderr}`)
+    if (!spent || askedAccount || me.cancelled || next.signal.aborted) break
+    await markSpent($, account, launch.model)
+  }
+
+  if (current.conversation) await $.state.set(LAST, current.conversation)
+  if (current.savedUsd) await addSavings($, current.savedUsd)
+  return { result: summarize(current, stderr) }
+}
+
+export const register: Register = (on, rawOptions) => {
+  options = readOptions(rawOptions as Record<string, unknown>)
+  agyExe = options.agy_path
+
+  on('session.start', async ($, e, next) => {
+    await $.tool.register({
+      name: TOOL,
+      description:
+        'Delegate a task to Antigravity CLI (agy, Gemini) on this machine, like a sub-agent: code, repo scans, long reading, web search and browsing (it has search_web, read_url_content and a browser). ' +
+        'agy runs with permissions bypassed in the given working directory (the session directory by default) and returns its final answer. ' +
+        'Live progress is shown in the Antigravity pane. Set continue_conversation to follow up on the previous agy run.',
+      isDeferred: false,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string', description: 'The task for agy, written as a complete instruction.' },
+          account: { type: 'string', description: 'agy sign-in to use (main, or a profile name). Empty: the first one with Gemini quota left.' },
+          cwd: { type: 'string', description: 'Working directory for agy. Defaults to the configured default_cwd, else the session directory.' },
+          continue_conversation: { type: 'boolean', description: 'Continue the most recent agy conversation started from this session.' },
+          conversation: { type: 'string', description: 'An explicit agy conversation id to resume.' },
+          model: { type: 'string', description: 'agy --model slug; empty uses the configured default.' },
+          effort: { type: 'string', enum: [...EFFORTS], description: 'Reasoning effort for this run; empty uses the configured default.' },
+          mode: { type: 'string', enum: [...MODES], description: '"plan": agy only plans, changes nothing. "accept-edits": agy may edit files but not run commands. Empty: full access.' },
+          agent: { type: 'string', description: 'Name of an agent defined in agy (see `agy agents`) to run the task with.' },
+          project: { type: 'string', description: 'agy project id or name for this run.' },
+          add_dirs: { type: 'array', items: { type: 'string' }, description: 'Extra directories agy may read and edit besides cwd.' },
+          json_schema: { type: 'string', description: 'A JSON schema (as JSON text, or a path to a schema file) the final answer must conform to.' },
+          sandbox: { type: 'boolean', description: 'Run agy in its sandbox with terminal restrictions.' },
+          timeout_minutes: { type: 'number', description: `Maximum minutes to wait for agy (default ${DEFAULT_MINUTES}, at most 60).` },
+        },
+        required: ['prompt'],
+      },
+    })
+    await $.command.register({
+      name: 'agy',
+      description: 'Antigravity: /agy opens the pane, /agy <prompt> runs agy, /agy usage shows quota, /agy accounts [add <name>] lists or adds sign-ins, /agy cancel stops the run',
+    })
+    // A reload ends the loops that were reading agy: close out any run still marked live.
+    {
+      const { value: known = [] } = await $.state.get(RUNS)
+      if (known.some(isLive)) {
+        await $.state.set(RUNS, known.map(one => (isLive(one) ? { ...one, status: 'error' as const, phase: undefined, error: 'interrupted (plugin reloaded)', endedAt: Date.now() } : one)))
+      }
+    }
+    // The stage animates from here: frames step while a run is live (and briefly after one ends),
+    // a quarter as fast otherwise, and only while the pane has been drawn lately.
+    let tick = 0
+    $.clock.every(Math.round(1000 / FPS), () => {
+      tick++
+      if (Date.now() - stageSeenAt > 3_000) return
+      const last = lastRuns[lastRuns.length - 1]
+      // Motion only while agy works, and for the few seconds of confetti after; otherwise the stage stands still.
+      const lively = last ? isLive(last) || (last.endedAt !== undefined && Date.now() - last.endedAt < 6_000) : false
+      if (!lively) return
+      void update($, frame, n => n + 1)
+    })
+    const started = await next(e)
+    // The pane opens with the first run (or /agy), not in every session.
+    void checkAgy($)
+      .then(async health => {
+        await $.state.set(HEALTH, health)
+        if (health.ok) await $.state.set(MODELS, await loadModels($))
+      })
+      .catch(() => undefined)
+    return started
+  })
+
+  on('prompt.compose', async ($, e, next) => {
+    const composed = await next(e)
+    if (!e.tools.includes(FULL_TOOL)) return composed
+    return { sections: [...composed.sections, { id: 'agy4claude:delegate', text: DELEGATION_GUIDE, scope: 'session' }] }
+  })
+
+  on('tool.call', { tool: FULL_TOOL }, async ($, e, next) => {
+    const input = e as unknown as RunInput
+    const prompt = String(input.prompt ?? '').trim()
+    if (!prompt) return { result: 'agy4claude: prompt is required.' }
+    if (active) return { result: `agy4claude: an agy run is already in progress (job ${active.job}). Wait for it, or stop it with /agy cancel.` }
+    if (input.effort !== undefined && String(input.effort).trim() && !asEffort(input.effort)) {
+      return { result: `agy4claude: effort must be one of ${EFFORTS.join(', ')}.` }
+    }
+    if (input.mode !== undefined && String(input.mode).trim() && !asMode(input.mode)) {
+      return { result: `agy4claude: mode must be one of ${MODES.join(', ')}.` }
+    }
+
+    // Claim the one slot before any await: two parallel calls must not both pass the check above.
+    const claim: Active = { job: 'starting', stream: null, cancelled: false }
+    active = claim
+    try {
+      return await runTask($, input, prompt, next, claim)
+    } finally {
+      if (active === claim) active = null
+    }
   })
 
   on('command.run', { command: 'agy' }, async ($, e) => {
     const args = e.args.trim()
+    const t = await stringsOf($)
     if (!args) {
       await $.ui.open({ id: PANE, title: 'Antigravity', focus: true })
       const health = await checkAgy($)
       await $.state.set(HEALTH, health)
-      return { text: `Antigravity pane opened. ${health.message}` }
+      if (health.ok) await $.state.set(MODELS, await loadModels($))
+      return { text: `${t.opened} ${health.message}` }
+    }
+    if (args === 'accounts' || args.startsWith('accounts add')) {
+      const name = args.slice('accounts add'.length).trim()
+      const dir = await profilesDirOf($)
+      if (args.startsWith('accounts add')) {
+        if (!/^[A-Za-z0-9_-]+$/.test(name) || name === MAIN) return { text: t.addUsage }
+        if (!dir) return { text: t.noHome }
+        await $.process.run(['mkdir', '-p', `${dir}/${name}`])
+        return { text: `${t.created(`${dir}/${name}`)}\n\n  HOME="${dir}/${name}" agy\n\n${t.joins(Boolean(options.account_order))}` }
+      }
+      const all = await accountsOf($)
+      const { rotation } = await settingsOf($)
+      return {
+        text: `${t.accountsHead(t.rot[rotation])}\n${all.map(n => `  ${n}${n === MAIN ? ` ${t.ownSignIn}` : `  ${dir}/${n}`}`).join('\n')}\n\n${t.addHint}`,
+      }
+    }
+    if (args === 'usage') {
+      await $.ui.open({ id: PANE, title: 'Antigravity' })
+      const quota = await checkQuota($)
+      const lines = quota.accounts.map(one =>
+        one.gemini.left < 0 && one.other.left < 0
+          ? `${one.name}: ${t.unreadable}`
+          : `${one.name}: Gemini ${fmtLeft(one.gemini.left)}${one.gemini.resetAt ? ` (${t.resets} ${one.gemini.resetAt})` : ''} · Claude/GPT ${fmtLeft(one.other.left)}`)
+      return { text: `${t.usageHead}\n${lines.join('\n')}` }
     }
     if (args === 'cancel') {
       const job = await cancelActive()
-      return { text: job ? `agy: cancelled job ${job}.` : 'agy: nothing is running.' }
+      return { text: job ? t.cancelled(job) : t.nothingRunning }
     }
     await $.ui.open({ id: PANE, title: 'Antigravity' })
     const ran = await $.tool.call({ tool: FULL_TOOL, prompt: args } as never)
@@ -551,122 +1014,250 @@ export const register: Register = (on, rawOptions) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Markdown, Button } = $.ui.resolve(e)
+    const elements = $.ui.resolve(e)
+    const { Box, Text, Markdown, Button } = elements
+    // Mobile draws no pickers and the terminal no Svg: each falls back to text.
+    // Named by surface: the element table answers every name, drawing nothing for one the surface lacks.
+    const Select = e.surface === 'mobile' ? undefined : (elements as { Select?: ElementConstructor<SelectProps> }).Select
+    const Svg = e.surface === 'terminal' ? undefined : (elements as { Svg?: ElementConstructor<SvgProps> }).Svg
+    const t = await stringsOf($)
     const { value: list = [] } = await $.state.get(RUNS)
     const { value: health = null } = await $.state.get(HEALTH)
-    const rows = Math.max(12, e.viewport?.rows ?? 40)
+    const { value: quota = null } = await $.state.get(QUOTA)
+    const { value: models = [] } = await $.state.get(MODELS)
+    const { value: open = false } = await $.state.get(SETTINGS_OPEN)
+    const { value: expanded = [] } = await $.state.get(EXPANDED)
+    const { value: tick = 0 } = await $.state.get({ plugin: 'agy4claude', key: 'frame' } as const)
+    const settings = await settingsOf($)
+    const savings = await savingsOf($)
+    const pool = poolOf(settings.model)
+    const now = Date.now()
+    lastRuns = list
     const run = list[list.length - 1]
+    const live = run ? isLive(run) : false
 
+    const caption = (text: string) => <Text size="caption" weight="semibold" dimColor>{text}</Text>
+
+    // ---- header: mark, name, savings
+    const todayUsd = savings.days[dayKey(now)] ?? 0
     const header = (
-      <Box justifyContent="space-between">
-        <Text color={health ? (health.ok ? 'success' : 'error') : 'inactive'} wrap="truncate">
-          {health ? (health.ok ? '●' : '○') : '○'} {health ? health.message : `agy (${options.agy_path}) · checking…`}
-        </Text>
-        <Text dimColor>{list.length > 0 ? `${list.length} run${list.length === 1 ? '' : 's'}` : 'Antigravity'}</Text>
+      <Box justifyContent="space-between" alignItems="center" gap={1}>
+        <Box gap={1} alignItems="center" flexShrink={1} minWidth={0}>
+          {Svg ? <Svg source={LOGO_SVG} alt="Antigravity" width={34} height={34} /> : <Text color="claude" bold>◉</Text>}
+          <Box flexDirection="column" flexShrink={1} minWidth={0}>
+            <Text weight="semibold">Antigravity</Text>
+            <Text size="caption" dimColor wrap="truncate">{t.subtitle}{health?.ok ? ` · ${health.message}` : health ? '' : ` · ${t.checking}`}</Text>
+          </Box>
+        </Box>
+        <Box flexShrink={0}>{Svg
+          ? <Svg source={savingsSvg(t.saved, fmtUsd(savings.total), t.today(todayUsd.toFixed(2)))} alt={`${t.saved} ${fmtUsd(savings.total)}`} />
+          : <Text color="warning">{t.saved} {fmtUsd(savings.total)} · {t.today(todayUsd.toFixed(2))}</Text>}</Box>
       </Box>
     )
+    const healthLine = health && !health.ok ? <Text color="error" size="footnote" wrap="wrap">○ {health.message}</Text> : null
 
-    if (!run) {
+    // ---- the stage
+    const planets = (quota?.accounts ?? []).map(a => ({ name: a.name, left: a[pool].left, current: a.name === run?.account }))
+    const allSpent = planets.length > 0 && planets.every(p => p.left >= 0 && p.left <= options.min_quota)
+    const mood = moodOf(run, allSpent, now)
+    const status = statusLook(run, t)
+    const elapsed = run ? fmtElapsed((run.endedAt ?? now) - run.startedAt) : ''
+    const doing = run && live ? [...run.steps].reverse().find(s => s.state !== 'DONE') : undefined
+    const toolCount = run ? run.steps.filter(s => s.type === 'tool').length : 0
+    const stageStatus = !run
+      ? (allSpent ? t.status.sleeping : t.status.idle)
+      : `${status.label}${run.account ? ` · ${t.onAccount(run.account)}` : ''}`
+    const stageSub = !run
+      ? ''
+      : live
+        ? (doing ? t.step(toolCount, `${doing.tool ?? doing.type}${doing.summary ? ` ${oneLine(doing.summary, 24)}` : ''}`) : (run.phase ? (t.phase[run.phase] ?? `${run.phase}…`) : t.waiting))
+        : t.toolsTokens(toolCount, run.usage ? fmtTokens(run.usage.total) : '–')
+    if (Svg) stageSeenAt = now
+    const stage = Svg ? (
+      <Svg source={stageSvg({ mood, t: tick / FPS, planets, status: stageStatus, timer: run ? elapsed : '', sub: stageSub })}
+        alt={`${stageStatus}${elapsed ? ` · ${elapsed}` : ''} · ${planets.map(p => `${p.name} ${fmtLeft(p.left)}`).join(', ')}`} />
+    ) : (
+      <Box flexDirection="column" borderStyle="round" borderColor={status.color} paddingX={1}>
+        <Box justifyContent="space-between"><Text color={status.color} bold>{status.icon} {stageStatus}</Text><Text tabular>{elapsed}</Text></Box>
+        {stageSub ? <Text dimColor wrap="truncate">{stageSub}</Text> : null}
+        {planets.map(p => (
+          <Box key={`acct-${p.name}`} gap={1}>
+            <Box width={8}><Text bold={p.current} wrap="truncate">{p.name}</Text></Box>
+            <Text mono color={p.left >= 0 && p.left <= 15 ? 'error' : p.left >= 0 && p.left <= 40 ? 'warning' : 'claude'}>{meterText(p.left)}</Text>
+            <Text tabular>{fmtLeft(p.left)}</Text>
+          </Box>
+        ))}
+      </Box>
+    )
+    const cancelRow = live ? (
+      <Box justifyContent="flex-end">
+        <Button key="cancel" variant="secondary" hotkey="c" onPress={() => { void cancelActive() }}>{t.cancel}</Button>
+      </Box>
+    ) : null
+
+    // ---- the conversation: every run of the newest conversation, Claude's ask then Gemini's reply
+    const thread = run
+      ? (run.conversation ? list.filter(one => one.conversation === run.conversation || one.job === run.job) : [run])
+      : []
+    const bubble = (one: AgyRun, index: number) => {
+      const asked = index === 0 ? t.claudeAsks : t.claudeFollows
+      const oneLive = isLive(one)
+      const full = one.response && one.response.trim()
+        ? tidyReply(one.response.length > MAX_RESULT_SHOWN ? `…\n${one.response.slice(-MAX_RESULT_SHOWN)}` : one.response)
+        : ''
+      const lines = full.split('\n')
+      const long = lines.length > FOLD_LINES || full.length > FOLD_CHARS
+      const isOpen = expanded.includes(one.job)
+      // Fold at whole lines only, so a link or a code span is never cut in half.
+      const kept: string[] = []
+      let used = 0
+      for (const one of lines) {
+        if (kept.length >= FOLD_LINES || (kept.length > 0 && used + one.length > FOLD_CHARS)) break
+        kept.push(one)
+        used += one.length + 1
+      }
+      const reply = long && !isOpen ? `${kept.join('\n').trimEnd()}\n\n…` : full
+      const tail = one.text.split('\n').filter(l => l.trim()).slice(-6).join('\n')
+      const meta = [
+        `${t.agentReplies}${one.account ? ` · ${t.onAccount(one.account)}` : ''}`,
+        oneLive ? null : fmtElapsed((one.endedAt ?? now) - one.startedAt),
+        one.savedUsd ? t.savedAbout(fmtUsd(one.savedUsd)) : null,
+      ].filter(Boolean).join(' · ')
       return (
-        <Box flexDirection="column">
-          {header}
-          <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={1} marginTop={1}>
-            <Text bold>Antigravity sub-agent</Text>
-            <Text dimColor wrap="wrap">
-              Ask Claude to hand a task to agy, or type /agy {'<prompt>'}. Each run shows up here with its tool calls, live output and final answer.
-            </Text>
+        <Box key={`turn-${one.job}`} flexDirection="column" gap={1}>
+          <Box gap={1} alignItems="flex-start">
+            {Svg ? <Svg source={CLAUDE_AVATAR} alt="Claude" width={26} height={26} /> : <Text color="claude">✻</Text>}
+            <Box flexDirection="column" flexShrink={1}>
+              <Text size="caption" dimColor>{asked} · {fmtAgo(one.startedAt, t)}</Text>
+              <Box backgroundColor="#F6F5F3" paddingX={1}><Text color="#3F3F46" wrap="wrap">{one.prompt}</Text></Box>
+            </Box>
+          </Box>
+          <Box gap={1} alignItems="flex-start">
+            {Svg ? <Svg source={ROBOT_AVATAR} alt="Gemini" width={26} height={26} /> : <Text color="#6D5DF6">◉</Text>}
+            <Box flexDirection="column" flexShrink={1} flexGrow={1}>
+              <Text size="caption" dimColor wrap="truncate">{meta}</Text>
+              <Box flexDirection="column" borderStyle="round" borderColor={one.status === 'error' ? 'error' : '#C7D2FE'} paddingX={1}>
+                {reply
+                  ? <Markdown text={reply} />
+                  : <Text dimColor wrap="wrap">{oneLive ? (tail || t.waiting) : one.error ? '' : t.noOutput}</Text>}
+                {one.error ? <Text color="error" wrap="wrap">✕ {one.error}</Text> : null}
+                {long ? (
+                  <Box>
+                    <Button key={`fold-${one.job}`} plain
+                      onPress={() => { void update($, expandedRuns, list => (list.includes(one.job) ? list.filter(j => j !== one.job) : [...list, one.job].slice(-20))) }}>
+                      {isOpen ? t.showLess : t.showAll}
+                    </Button>
+                  </Box>
+                ) : null}
+              </Box>
+            </Box>
           </Box>
         </Box>
       )
     }
 
-    const live = isLive(run)
-    const look = statusLook(run)
-    const elapsed = fmtElapsed((run.endedAt ?? Date.now()) - run.startedAt)
-    const meta = [
-      run.conversation ? `conv ${shortId(run.conversation)}` : null,
-      run.model ? `model ${run.model}` : null,
-      ...launchTags(run),
-      run.numTurns ? `${run.numTurns} turn${run.numTurns === 1 ? '' : 's'}` : null,
-      run.usage ? `${fmtTokens(run.usage.total)} tokens` : null,
-    ].filter(Boolean).join(' · ')
+    // ---- activity of the newest run
+    const rows = Math.max(12, e.viewport?.rows ?? 40)
+    const stepRoom = Math.max(4, Math.min(12, Math.floor(rows / 4)))
+    const shownSteps = run ? run.steps.slice(-stepRoom) : []
+    const hiddenSteps = run ? run.steps.length - shownSteps.length : 0
+    const activity = run ? (
+      <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
+        <Box justifyContent="space-between" gap={1}>
+          {caption(t.activity)}
+          <Text size="caption" dimColor wrap="truncate">{toolCount === 0 ? (live ? t.noToolsYet : t.noTools) : t.toolCalls(toolCount)}{run.usage ? ` · ${fmtTokens(run.usage.total)} tokens` : ''}</Text>
+        </Box>
+        {hiddenSteps > 0 ? <Text size="caption" dimColor>⋯ {t.earlier(hiddenSteps)}</Text> : null}
+        {shownSteps.map(step => (
+          <Box key={`step-${step.index}`} gap={1}>
+            <Text color={step.error ? 'error' : step.state === 'DONE' ? '#4F46E5' : '#6D5DF6'}>{step.error ? '✕' : step.state === 'DONE' ? '✓' : '▸'}</Text>
+            <Text mono weight={step.state !== 'DONE' ? 'semibold' : 'regular'}>{step.tool ?? step.type}</Text>
+            <Text dimColor wrap="truncate">{step.error ? `! ${step.error}` : step.summary ?? ''}</Text>
+          </Box>
+        ))}
+      </Box>
+    ) : null
 
-    const stepRoom = Math.max(4, Math.min(14, Math.floor(rows / 4)))
-    const shownSteps = run.steps.slice(-stepRoom)
-    const hiddenSteps = run.steps.length - shownSteps.length
-    const toolCalls = run.steps.filter(s => s.type === 'tool').length
-
-    const hasResult = run.response !== undefined && run.response.trim() !== ''
-    const streamTail = run.text.split('\n').filter(l => l.trim()).slice(-Math.max(3, Math.min(12, Math.floor(rows / 5)))).join('\n')
-    const resultText = hasResult
-      ? run.response!.length > MAX_RESULT_SHOWN ? `…\n${run.response!.slice(-MAX_RESULT_SHOWN)}` : run.response!
-      : ''
-    const history = list.slice(0, -1).slice(-4).reverse()
-
-    return (
+    // ---- earlier conversations
+    const seen = new Set<string>(thread.map(one => one.job))
+    const history: AgyRun[] = []
+    for (const one of [...list].reverse()) {
+      if (seen.has(one.job)) continue
+      if (one.conversation && history.some(h => h.conversation === one.conversation)) continue
+      history.push(one)
+      if (history.length >= 4) break
+    }
+    const historyBox = history.length > 0 ? (
       <Box flexDirection="column">
-        {header}
-
-        <Box flexDirection="column" borderStyle="round" borderColor={look.color} paddingX={1} marginTop={1}>
-          <Box gap={2}>
-            <Text color={look.color} bold>{look.icon} {look.label}</Text>
-            <Text dimColor>{elapsed}</Text>
-            {live && run.phase ? <Text color="claude">{run.phase}…</Text> : null}
-          </Box>
-          <Text dimColor wrap="truncate-start">{run.cwd || '(session directory)'}{meta ? `  ·  ${meta}` : ''}</Text>
-          <Box marginTop={1} flexDirection="column">
-            <Text dimColor>TASK</Text>
-            <Text wrap="wrap">{oneLine(run.prompt, 600)}</Text>
-          </Box>
-        </Box>
-
-        <Box flexDirection="column" marginTop={1}>
-          <Box gap={1}>
-            <Text bold>Activity</Text>
-            <Text dimColor>{toolCalls === 0 ? (live ? 'no tool calls yet' : 'no tool calls') : `${toolCalls} tool call${toolCalls === 1 ? '' : 's'}`}</Text>
-          </Box>
-          {hiddenSteps > 0 ? <Text dimColor>  … {hiddenSteps} earlier</Text> : null}
-          {shownSteps.map(step => (
-            <Box gap={1}>
-              <Text color={step.error ? 'error' : step.state === 'DONE' ? 'success' : 'claude'}>
-                {step.error ? '✗' : step.state === 'DONE' ? '✓' : '▶'}
-              </Text>
-              <Text bold={step.state !== 'DONE'} dimColor={step.state === 'DONE' && !step.error}>{step.tool ?? step.type}</Text>
-              <Text dimColor wrap="truncate">{step.error ? `! ${step.error}` : step.summary ?? ''}</Text>
+        {caption(t.history)}
+        {history.map(one => {
+          const past = statusLook(one, t)
+          return (
+            <Box key={`hist-${one.job}`} gap={1} justifyContent="space-between">
+              <Box gap={1} flexShrink={1} minWidth={0}>
+                <Text color={past.color}>{past.icon}</Text>
+                <Text size="footnote" wrap="truncate">{oneLine(one.prompt, 80)}</Text>
+              </Box>
+              {/* The meta keeps its one line; the prompt gives way. */}
+              <Box flexShrink={0}>
+                <Text size="footnote" dimColor wrap="truncate">{one.account ? `@${one.account} · ` : ''}{fmtAgo(one.startedAt, t)}</Text>
+              </Box>
             </Box>
-          ))}
-        </Box>
+          )
+        })}
+      </Box>
+    ) : null
 
-        <Box flexDirection="column" marginTop={1}>
-          <Text bold>{hasResult ? 'Result' : 'Output'}</Text>
-          <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
-            {hasResult
-              ? <Markdown text={resultText} />
-              : <Text dimColor wrap="wrap">{streamTail || (live ? 'Waiting for agy…' : '(no output)')}</Text>}
-          </Box>
-          {run.error ? <Text color="error" wrap="wrap">✗ {run.error}</Text> : null}
+    // ---- settings, folded into one line at the bottom
+    const modelOptions = [
+      { value: '', label: t.agyDefault },
+      ...models,
+      ...(settings.model && !models.some(m => m.value === settings.model) ? [{ value: settings.model, label: settings.model }] : []),
+    ]
+    const modelName = settings.model ? (models.find(m => m.value === settings.model)?.label ?? settings.model) : t.agyDefault
+    const settingsBar = (
+      <Box flexDirection="column" backgroundColor="#F4F4F5" paddingX={1}>
+        <Box justifyContent="space-between" alignItems="center" gap={1}>
+          <Text size="footnote" color="#52525B" wrap="truncate">⚙ {modelName}{settings.effort ? ` · ${settings.effort}` : ''} · {t.rotShort[settings.rotation]} · {t.langShort[settings.language]}</Text>
+          <Button key="settings" plain onPress={() => { void $.state.set(SETTINGS_OPEN, !open) }}>{open ? t.close : t.settings}</Button>
         </Box>
-
-        {live ? (
-          <Box marginTop={1}>
-            <Button key="cancel" variant="secondary" hotkey="c" onPress={() => { void cancelActive() }}>Cancel run</Button>
+        {open && Select ? (
+          <Box flexDirection="column">
+            <Select key="model" label={t.model} options={modelOptions} value={settings.model}
+              onSelect={value => { void saveSetting($, { model: value }) }} />
+            <Select key="effort" label={t.effort} options={[{ value: '', label: t.agyDefault }, ...EFFORTS.map(v => ({ value: v }))]} value={settings.effort}
+              onSelect={value => { void saveSetting($, { effort: asEffort(value) }) }} />
+            <Select key="rotation" label={t.rotation} value={settings.rotation}
+              options={ROTATIONS.map(v => ({ value: v, label: t.rot[v] }))}
+              onSelect={value => { void saveSetting($, { rotation: asRotation(value) }) }} />
+            <Select key="language" label={t.language} value={settings.language}
+              options={[{ value: 'auto', label: t.langAuto }, { value: 'en', label: 'English' }, { value: 'zh-TW', label: '繁體中文' }]}
+              onSelect={value => { void saveSetting($, { language: asLanguage(value) }) }} />
           </Box>
         ) : null}
+      </Box>
+    )
 
-        {history.length > 0 ? (
-          <Box flexDirection="column" marginTop={1}>
-            <Text bold>Earlier</Text>
-            {history.map(one => {
-              const past = statusLook(one)
-              return (
-                <Box gap={1}>
-                  <Text color={past.color}>{past.icon}</Text>
-                  <Text dimColor wrap="truncate">{fmtAgo(one.startedAt)} · {fmtElapsed((one.endedAt ?? one.startedAt) - one.startedAt)} · {oneLine(one.prompt, 70)}</Text>
-                </Box>
-              )
-            })}
-          </Box>
-        ) : null}
+    // The pane fills its room: history and settings sink to the bottom, a spacer takes what is left.
+    const room = (e.props as { scroll?: { bodyRows?: number } }).scroll?.bodyRows
+    return (
+      <Box flexDirection="column" gap={1} minHeight={room && room > 0 ? room : undefined}>
+        {header}
+        {healthLine}
+        {stage}
+        {cancelRow}
+        {run
+          ? <Box flexDirection="column" gap={1}>{thread.map((one, i) => bubble(one, i))}</Box>
+          : (
+            <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
+              <Text weight="semibold">{t.emptyTitle}</Text>
+              <Text dimColor wrap="wrap">{t.emptyBody}</Text>
+            </Box>
+          )}
+        {activity}
+        <Box flexGrow={1} />
+        {historyBox}
+        {settingsBar}
       </Box>
     )
   })
