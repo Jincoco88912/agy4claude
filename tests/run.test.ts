@@ -1,5 +1,5 @@
 import type { On, ProcessSpawnChunk } from 'claude-code'
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 
 const FULL_TOOL = 'mcp__agy-bridge__run'
 const OPTIONS = { agy_path: 'agy', default_cwd: '', model: '' }
@@ -21,6 +21,7 @@ const engineBottom = (on: On, { agyFound = true } = {}) => {
     if (!agyFound) return { deny: 'ENOENT' }
     return { value: version }
   })
+  mock.env(on, {})
 }
 
 test('runs a prompt through agy, folds its stream-json output and shows the run in the pane', { options: OPTIONS }, async ($, on) => {
@@ -133,4 +134,67 @@ test('an agy that cannot start answers the model with an error text instead of f
   const ui = await $.ui.mount({ plugin: 'agy-bridge', surface: 'terminal', component: 'Pane', requestId: 'agy', props: PANE_PROPS })
   expect(await ui.find({ type: 'Text', text: /agy not available/ })).toBeDefined()
   await ui.unmount()
+})
+
+test('every launch option becomes the matching agy flag, defaults coming from the plugin options', { options: { ...OPTIONS, effort: 'high', agent: 'reviewer', sandbox: true } }, async ($, on) => {
+  engineBottom(on)
+  const calls: (readonly string[])[] = []
+  on('process.spawn', async function* (_$, e) {
+    calls.push(e.argv)
+    yield out(line({ event: 'result', result: { conversation_id: 'c', status: 'SUCCESS', response: '{"ok":true}' } }))
+    return { value: { code: 0, signal: null } }
+  })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+
+  const explicit = await $.tool.call({
+    tool: FULL_TOOL, prompt: 'plan it', mode: 'plan', effort: 'low', agent: 'planner', project: 'proj-1',
+    add_dirs: ['/shared/lib', '/shared/docs'], json_schema: '{"type":"object"}', sandbox: false,
+  } as never)
+  const argv = calls[0]
+  const after = (flag: string) => argv[argv.indexOf(flag) + 1]
+  expect(after('--mode')).toBe('plan')
+  expect(after('--effort')).toBe('low')
+  expect(after('--agent')).toBe('planner')
+  expect(after('--project')).toBe('proj-1')
+  expect(after('--json-schema')).toBe('{"type":"object"}')
+  expect(argv.filter(a => a === '--add-dir').length).toBe(2)
+  expect(argv).toContain('/shared/docs')
+  expect(argv).not.toContain('--sandbox')
+  expect(argv[argv.length - 1]).toBe('plan it')
+  expect(String(explicit.result)).toContain('mode plan')
+  expect(String(explicit.result)).toContain('json-schema')
+
+  await $.tool.call({ tool: FULL_TOOL, prompt: 'defaults' } as never)
+  const plain = calls[1]
+  expect(plain[plain.indexOf('--effort') + 1]).toBe('high')
+  expect(plain[plain.indexOf('--agent') + 1]).toBe('reviewer')
+  expect(plain).toContain('--sandbox')
+  expect(plain).not.toContain('--mode')
+  expect(plain).not.toContain('--json-schema')
+
+  const bad = await $.tool.call({ tool: FULL_TOOL, prompt: 'x', mode: 'yolo' } as never)
+  expect(String(bad.result)).toContain('mode must be one of')
+  expect(calls.length).toBe(2)
+})
+
+test('when agy is not on PATH a well-known install location is found and used', { options: OPTIONS }, async ($, on) => {
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('tool.register', (_$, e) => ({ value: { tool: `mcp__agy-bridge__${e.name}` } }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('ui.status', () => ({ value: undefined }))
+  mock.env(on, { HOME: '/Users/me' })
+  on('process.run', (_$, e) => (e.argv[0] === '/opt/homebrew/bin/agy' ? { value: version } : { deny: 'ENOENT' }))
+  let spawnedWith = ''
+  on('process.spawn', async function* (_$, e) {
+    spawnedWith = e.argv[0]
+    yield out(line({ event: 'result', result: { status: 'SUCCESS', response: 'hi' } }))
+    return { value: { code: 0, signal: null } }
+  })
+
+  await $.session.start({ cwd: '/tmp', surface: 'desktop', isInteractive: true })
+  const opened = await $.command.run({ command: 'agy', args: '' } as never)
+  expect(String(opened.text)).toContain('agy 1.3.3 at /opt/homebrew/bin/agy')
+  await $.tool.call({ tool: FULL_TOOL, prompt: 'hello' } as never)
+  expect(spawnedWith).toBe('/opt/homebrew/bin/agy')
 })

@@ -1,6 +1,6 @@
 import type { EngineInterface, HookStream, ProcessSpawnChunk, ProcessSpawnResult, Register, Timer } from 'claude-code'
 
-import type { AgyHealth, AgyRun, AgyStep, AgyUsage } from '../types'
+import type { AgyEffort, AgyHealth, AgyLaunch, AgyMode, AgyRun, AgyStep, AgyUsage } from '../types'
 
 const PANE = 'agy'
 const TOOL = 'run'
@@ -10,6 +10,8 @@ const MAX_TEXT = 20_000
 const MAX_STDERR = 4_000
 const MAX_RESULT_SHOWN = 6_000
 const DEFAULT_MINUTES = 10
+const EFFORTS: readonly AgyEffort[] = ['low', 'medium', 'high', 'xhigh', 'max']
+const MODES: readonly AgyMode[] = ['plan', 'accept-edits']
 
 // `$.state` refs: plugin and key are literals, as the validator asks.
 const RUNS = { plugin: 'agy-bridge', key: 'runs' } as const
@@ -20,6 +22,9 @@ type Options = {
   agy_path: string
   default_cwd: string
   model: string
+  effort: AgyEffort | ''
+  agent: string
+  sandbox: boolean
 }
 
 type RunInput = {
@@ -28,6 +33,13 @@ type RunInput = {
   continue_conversation?: boolean
   conversation?: string
   model?: string
+  effort?: string
+  mode?: string
+  agent?: string
+  project?: string
+  add_dirs?: unknown
+  json_schema?: string
+  sandbox?: boolean
   timeout_minutes?: number
 }
 
@@ -72,10 +84,30 @@ type Active = {
   cancelled: boolean
 }
 
+const asEffort = (value: unknown): AgyEffort | '' => {
+  const text = String(value ?? '').trim().toLowerCase()
+  return (EFFORTS as readonly string[]).includes(text) ? (text as AgyEffort) : ''
+}
+
+const asMode = (value: unknown): AgyMode | '' => {
+  const text = String(value ?? '').trim().toLowerCase().replace('_', '-')
+  return (MODES as readonly string[]).includes(text) ? (text as AgyMode) : ''
+}
+
+const asBool = (value: unknown): boolean => value === true || String(value ?? '').trim().toLowerCase() === 'true'
+
+const asDirs = (value: unknown): string[] => {
+  const raw = Array.isArray(value) ? value : typeof value === 'string' && value.trim() ? value.split(/[\n;]/) : []
+  return raw.map(one => String(one ?? '').trim()).filter(Boolean)
+}
+
 const readOptions = (options: Record<string, unknown>): Options => ({
   agy_path: String(options.agy_path ?? '').trim() || 'agy',
   default_cwd: String(options.default_cwd ?? '').trim(),
   model: String(options.model ?? '').trim(),
+  effort: asEffort(options.effort),
+  agent: String(options.agent ?? '').trim(),
+  sandbox: asBool(options.sandbox),
 })
 
 const oneLine = (text: string, max: number): string => {
@@ -167,6 +199,8 @@ const applyEvent = (run: AgyRun, raw: string): AgyRun => {
 }
 
 let options: Options = readOptions({})
+/** The agy executable runs use: the configured one, or the first well-known install location that answers. */
+let agyExe = 'agy'
 /** The run in flight, if any: one agy at a time, so `/agy cancel` and the pane's button know what to stop. */
 let active: Active | null = null
 /** Redraws the pane each second while a run is live, so its clock moves. */
@@ -180,31 +214,92 @@ const cancelActive = async (): Promise<string | null> => {
   return stopping.job
 }
 
+/**
+ * Where agy tends to live when it is not on the PATH the engine inherited: a desktop app on macOS
+ * starts with a minimal PATH, so Homebrew's and agy's own bin folders are tried by full path.
+ */
+const wellKnownAgyPaths = async ($: EngineInterface): Promise<string[]> => {
+  const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? ''
+  const localAppData = await $.env.get('LOCALAPPDATA')
+  const unix = home ? [`${home}/.agy/bin/agy`, `${home}/.local/bin/agy`, `${home}/bin/agy`] : []
+  const windows = [
+    ...(localAppData ? [`${localAppData}\\agy\\bin\\agy.exe`] : []),
+    ...(home ? [`${home}\\AppData\\Local\\agy\\bin\\agy.exe`] : []),
+  ]
+  return [...unix, '/opt/homebrew/bin/agy', '/usr/local/bin/agy', ...windows]
+}
+
+const versionOf = async ($: EngineInterface, exe: string): Promise<string> => {
+  const ran = await $.process.run([exe, '--version'], { timeoutMs: 15_000 })
+  if (ran.exitCode !== 0) throw new Error(oneLine(ran.stderr || ran.stdout || `exit code ${ran.exitCode}`, 200))
+  return oneLine(ran.stdout, 40)
+}
+
+/** Finds a working agy, remembers it in `agyExe`, and reports it for the pane. */
+const checkAgy = async ($: EngineInterface): Promise<AgyHealth> => {
+  const tried: string[] = []
+  const candidates = [options.agy_path]
+  for (const one of await wellKnownAgyPaths($)) if (!candidates.includes(one)) candidates.push(one)
+  let firstError = ''
+  for (const exe of candidates) {
+    if (exe !== options.agy_path) {
+      // A missing file is skipped; a file system that cannot be asked (a test kit) leaves the candidate in.
+      let present = true
+      try {
+        present = await $.fs.exists(exe)
+      } catch {
+        present = true
+      }
+      if (!present) continue
+    }
+    tried.push(exe)
+    try {
+      const version = await versionOf($, exe)
+      agyExe = exe
+      const where = exe === options.agy_path ? '' : ` at ${exe}`
+      return { ok: true, message: `agy ${version || 'found'}${where}`, path: exe, checkedAt: Date.now() }
+    } catch (error) {
+      if (!firstError) firstError = (error as Error).message ?? String(error)
+    }
+  }
+  agyExe = options.agy_path
+  return {
+    ok: false,
+    message: `agy not available (${options.agy_path}): ${oneLine(firstError || 'not found', 160)}. Set agy_path in the plugin options.`,
+    checkedAt: Date.now(),
+  }
+}
+
 /** The exact agy command a run is. `-p` goes last: it takes the next token as the prompt. */
-const argvFor = (p: { prompt: string; conversation: string | null; model: string; timeout: string }): string[] => [
-  options.agy_path,
+const argvFor = (p: AgyLaunch & { prompt: string; conversation: string | null; timeout: string; jsonSchema: string }): string[] => [
+  agyExe,
   '--output-format', 'stream-json',
   '--dangerously-skip-permissions',
   ...(p.model ? ['--model', p.model] : []),
+  ...(p.effort ? ['--effort', p.effort] : []),
+  ...(p.mode ? ['--mode', p.mode] : []),
+  ...(p.agent ? ['--agent', p.agent] : []),
+  ...(p.project ? ['--project', p.project] : []),
+  ...p.addDirs.flatMap(dir => ['--add-dir', dir]),
+  ...(p.sandbox ? ['--sandbox'] : []),
+  ...(p.jsonSchema ? ['--json-schema', p.jsonSchema] : []),
   ...(p.conversation ? ['--conversation', p.conversation] : []),
   '--print-timeout', p.timeout,
   '-p', p.prompt,
 ]
 
-const checkAgy = async ($: EngineInterface): Promise<AgyHealth> => {
-  try {
-    const ran = await $.process.run([options.agy_path, '--version'], { timeoutMs: 15_000 })
-    if (ran.exitCode !== 0) throw new Error(oneLine(ran.stderr || ran.stdout || `exit code ${ran.exitCode}`, 200))
-    const version = oneLine(ran.stdout, 40)
-    return { ok: true, message: `agy ${version || 'found'}`, checkedAt: Date.now() }
-  } catch (error) {
-    const message = (error as Error).message ?? String(error)
-    return { ok: false, message: `agy not available (${options.agy_path}): ${message}`, checkedAt: Date.now() }
-  }
-}
-
 const replaceRun = (list: AgyRun[], next: AgyRun): AgyRun[] =>
   list.map(one => (one.job === next.job ? next : one))
+
+const launchTags = (run: AgyLaunch): string[] => [
+  run.mode ? `mode ${run.mode}` : '',
+  run.effort ? `effort ${run.effort}` : '',
+  run.agent ? `agent ${run.agent}` : '',
+  run.project ? `project ${run.project}` : '',
+  run.addDirs.length ? `+${run.addDirs.length} dir${run.addDirs.length === 1 ? '' : 's'}` : '',
+  run.sandbox ? 'sandbox' : '',
+  run.structured ? 'json-schema' : '',
+].filter(Boolean)
 
 const summarize = (run: AgyRun, stderr: string): string => {
   const seconds = Math.round(((run.endedAt ?? Date.now()) - run.startedAt) / 1000)
@@ -212,6 +307,7 @@ const summarize = (run: AgyRun, stderr: string): string => {
   const header = [
     `agy ${run.status} in ${seconds}s`,
     run.conversation ? `conversation ${run.conversation}` : null,
+    ...launchTags(run),
     toolsUsed.length ? `tools: ${toolsUsed.join(', ')}` : null,
     run.usage ? `${run.usage.total} tokens` : null,
   ].filter(Boolean).join(' | ')
@@ -262,11 +358,14 @@ const DELEGATION_GUIDE =
   'Treat it as a sub-agent: hand it a self-contained coding task when the user asks to delegate to agy or Antigravity, ' +
   'wants a second implementation or opinion from it, or wants work to proceed in parallel while you continue. ' +
   'Write the prompt as a complete instruction with the paths it needs; it runs with permissions bypassed in the given working directory. ' +
+  'Use mode "plan" when only a plan or review is wanted and nothing should change; "accept-edits" when it may edit files but should not run commands. ' +
+  'Use json_schema when you will parse its answer. ' +
   'Its final answer comes back as the tool result (live progress is in the Antigravity pane). ' +
   'Pass continue_conversation: true to follow up on its last run. Tell the user what you delegated and summarize what agy did.'
 
 export const register: Register = (on, rawOptions) => {
   options = readOptions(rawOptions as Record<string, unknown>)
+  agyExe = options.agy_path
 
   on('session.start', async ($, e, next) => {
     await $.tool.register({
@@ -284,6 +383,13 @@ export const register: Register = (on, rawOptions) => {
           continue_conversation: { type: 'boolean', description: 'Continue the most recent agy conversation started from this session.' },
           conversation: { type: 'string', description: 'An explicit agy conversation id to resume.' },
           model: { type: 'string', description: 'agy --model slug; empty uses the configured default.' },
+          effort: { type: 'string', enum: [...EFFORTS], description: 'Reasoning effort for this run; empty uses the configured default.' },
+          mode: { type: 'string', enum: [...MODES], description: '"plan": agy only plans, changes nothing. "accept-edits": agy may edit files but not run commands. Empty: full access.' },
+          agent: { type: 'string', description: 'Name of an agent defined in agy (see `agy agents`) to run the task with.' },
+          project: { type: 'string', description: 'agy project id or name for this run.' },
+          add_dirs: { type: 'array', items: { type: 'string' }, description: 'Extra directories agy may read and edit besides cwd.' },
+          json_schema: { type: 'string', description: 'A JSON schema (as JSON text, or a path to a schema file) the final answer must conform to.' },
+          sandbox: { type: 'boolean', description: 'Run agy in its sandbox with terminal restrictions.' },
           timeout_minutes: { type: 'number', description: `Maximum minutes to wait for agy (default ${DEFAULT_MINUTES}, at most 60).` },
         },
         required: ['prompt'],
@@ -310,17 +416,34 @@ export const register: Register = (on, rawOptions) => {
     const prompt = String(input.prompt ?? '').trim()
     if (!prompt) return { result: 'agy-bridge: prompt is required.' }
     if (active) return { result: `agy-bridge: an agy run is already in progress (job ${active.job}). Wait for it, or stop it with /agy cancel.` }
+    if (input.effort !== undefined && String(input.effort).trim() && !asEffort(input.effort)) {
+      return { result: `agy-bridge: effort must be one of ${EFFORTS.join(', ')}.` }
+    }
+    if (input.mode !== undefined && String(input.mode).trim() && !asMode(input.mode)) {
+      return { result: `agy-bridge: mode must be one of ${MODES.join(', ')}.` }
+    }
 
     const cwd = String(input.cwd ?? '').trim() || options.default_cwd
     const { value: previous = null } = await $.state.get(LAST)
     const conversation = input.conversation ?? (input.continue_conversation ? previous : null) ?? null
-    const model = String(input.model ?? '').trim() || options.model
+    const jsonSchema = String(input.json_schema ?? '').trim()
+    const launch: AgyLaunch = {
+      model: String(input.model ?? '').trim() || options.model,
+      effort: asEffort(input.effort) || options.effort,
+      mode: asMode(input.mode),
+      agent: String(input.agent ?? '').trim() || options.agent,
+      project: String(input.project ?? '').trim(),
+      addDirs: asDirs(input.add_dirs),
+      sandbox: input.sandbox === undefined ? options.sandbox : asBool(input.sandbox),
+      structured: jsonSchema !== '',
+    }
     const minutes = Math.max(1, Math.min(60, Math.round(Number(input.timeout_minutes) || DEFAULT_MINUTES)))
     const timeout = `${minutes}m`
     const job = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
 
     let current: AgyRun = {
-      job, prompt, cwd, model, conversation, status: 'starting', phase: 'starting agy', startedAt: Date.now(), steps: [], text: '',
+      ...launch,
+      job, prompt, cwd, conversation, status: 'starting', phase: 'starting agy', startedAt: Date.now(), steps: [], text: '',
     }
     const { value: known = [] } = await $.state.get(RUNS)
     let list: AgyRun[] = [...known, current].slice(-MAX_RUNS)
@@ -331,7 +454,8 @@ export const register: Register = (on, rawOptions) => {
     await $.state.set(RUNS, list)
     $.ui.status('agy: running')
 
-    const stream = $.process.spawn({ argv: argvFor({ prompt, conversation, model, timeout }), ...(cwd ? { cwd } : {}) })
+    const argv = argvFor({ ...launch, prompt, conversation, timeout, jsonSchema })
+    const stream = $.process.spawn({ argv, ...(cwd ? { cwd } : {}) })
     const me: Active = { job, stream, cancelled: false }
     active = me
     ticker?.cancel()
@@ -375,8 +499,8 @@ export const register: Register = (on, rawOptions) => {
     } catch (error) {
       const message = (error as Error).message ?? String(error)
       if (current.status === 'starting') {
-        current = { ...current, status: 'error', error: `could not start agy (${options.agy_path}): ${message}`, endedAt: Date.now() }
-        await $.state.set(HEALTH, { ok: false, message: `agy not available (${options.agy_path}): ${oneLine(message, 200)}`, checkedAt: Date.now() })
+        current = { ...current, status: 'error', error: `could not start agy (${agyExe}): ${message}`, endedAt: Date.now() }
+        await $.state.set(HEALTH, { ok: false, message: `agy not available (${agyExe}): ${oneLine(message, 200)}`, checkedAt: Date.now() })
       } else {
         current = { ...current, status: 'error', error: `agy output stream lost: ${message}`, endedAt: Date.now() }
       }
@@ -415,7 +539,7 @@ export const register: Register = (on, rawOptions) => {
       await $.ui.open({ id: PANE, title: 'Antigravity', focus: true })
       const health = await checkAgy($)
       await $.state.set(HEALTH, health)
-      return { text: `Antigravity pane opened. ${health.message}.` }
+      return { text: `Antigravity pane opened. ${health.message}` }
     }
     if (args === 'cancel') {
       const job = await cancelActive()
@@ -435,7 +559,7 @@ export const register: Register = (on, rawOptions) => {
 
     const header = (
       <Box justifyContent="space-between">
-        <Text color={health ? (health.ok ? 'success' : 'error') : 'inactive'}>
+        <Text color={health ? (health.ok ? 'success' : 'error') : 'inactive'} wrap="truncate">
           {health ? (health.ok ? '●' : '○') : '○'} {health ? health.message : `agy (${options.agy_path}) · checking…`}
         </Text>
         <Text dimColor>{list.length > 0 ? `${list.length} run${list.length === 1 ? '' : 's'}` : 'Antigravity'}</Text>
@@ -462,6 +586,7 @@ export const register: Register = (on, rawOptions) => {
     const meta = [
       run.conversation ? `conv ${shortId(run.conversation)}` : null,
       run.model ? `model ${run.model}` : null,
+      ...launchTags(run),
       run.numTurns ? `${run.numTurns} turn${run.numTurns === 1 ? '' : 's'}` : null,
       run.usage ? `${fmtTokens(run.usage.total)} tokens` : null,
     ].filter(Boolean).join(' · ')
@@ -513,7 +638,7 @@ export const register: Register = (on, rawOptions) => {
         </Box>
 
         <Box flexDirection="column" marginTop={1}>
-          <Text bold>{hasResult ? 'Result' : live ? 'Output' : 'Output'}</Text>
+          <Text bold>{hasResult ? 'Result' : 'Output'}</Text>
           <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
             {hasResult
               ? <Markdown text={resultText} />

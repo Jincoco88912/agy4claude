@@ -14,13 +14,28 @@ export type AgyUsage = {
   total: number
 }
 
-export type AgyRun = {
+export type AgyEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+export type AgyMode = 'plan' | 'accept-edits'
+
+/** How one agy run was launched: everything that became a command-line flag. */
+export type AgyLaunch = {
+  /** The `--model` slug given; empty means agy's default. */
+  model: string
+  effort: AgyEffort | ''
+  mode: AgyMode | ''
+  agent: string
+  project: string
+  addDirs: string[]
+  sandbox: boolean
+  /** True when a `--json-schema` was given. */
+  structured: boolean
+}
+
+export type AgyRun = AgyLaunch & {
   job: string
   prompt: string
   /** Working directory agy ran in; empty means the session's own. */
   cwd: string
-  /** The `--model` slug given; empty means agy's default. */
-  model: string
   conversation: string | null
   status: 'starting' | 'running' | 'done' | 'error' | 'cancelled'
   startedAt: number
@@ -37,7 +52,13 @@ export type AgyRun = {
   numTurns?: number
 }
 
-export type AgyHealth = { ok: boolean; message: string; checkedAt: number }
+export type AgyHealth = {
+  ok: boolean
+  message: string
+  /** The executable the plugin settled on, when agy was found. */
+  path?: string
+  checkedAt: number
+}
 
 declare module 'claude-code' {
   interface PluginState {

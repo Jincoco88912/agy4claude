@@ -1,6 +1,6 @@
 {
   "name": "agy-bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Drive Antigravity CLI (agy) on this machine as a sub-agent of Claude Code, with a live output pane.",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -21,6 +21,24 @@
       "title": "agy model",
       "description": "agy --model slug; empty uses agy's default",
       "default": ""
+    },
+    "effort": {
+      "type": "string",
+      "title": "Default effort",
+      "description": "agy --effort for every run unless the tool call gives one: low, medium, high, xhigh or max; empty uses agy's default",
+      "default": ""
+    },
+    "agent": {
+      "type": "string",
+      "title": "Default agent",
+      "description": "Name of an agy agent (see `agy agents`) to run tasks with unless the tool call gives one; empty uses agy's default",
+      "default": ""
+    },
+    "sandbox": {
+      "type": "boolean",
+      "title": "Sandbox by default",
+      "description": "Pass --sandbox (terminal restrictions) on every run unless the tool call says otherwise",
+      "default": false
     }
   }
 }

@@ -5,3 +5,6 @@ node_modules/
 .DS_Store
 Thumbs.db
 *.log
+
+# Cache of other tooling
+graft/
