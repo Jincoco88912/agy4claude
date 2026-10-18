@@ -256,8 +256,10 @@ const withProfiles = (on: On, left: Record<string, number>) => {
 test('runs rotate to the first sign-in with Gemini quota left, with HOME pointed at its profile', { options: OPTIONS }, async ($, on) => {
   withProfiles(on, { b: 3, c: 40, main: 90 })
   const homes: (string | undefined)[] = []
+  const ssh: (string | undefined)[] = []
   on('process.spawn', async function* (_$, e) {
     homes.push(e.env?.HOME)
+    ssh.push(e.env?.SSH_CONNECTION)
     yield out(line({ event: 'result', result: { conversation_id: 'conv-c', status: 'SUCCESS', response: 'ok' } }))
     return { value: { code: 0, signal: null } }
   })
@@ -266,10 +268,13 @@ test('runs rotate to the first sign-in with Gemini quota left, with HOME pointed
   const ran = await $.tool.call({ tool: FULL_TOOL, prompt: 'hi' } as never)
   expect(String(ran.result)).toContain('account c')
   expect(homes[0]).toBe('/Users/me/.agy-profiles/c')
+  // A profile keeps its token in a file (agy does when it sees SSH), not in the OS keychain.
+  expect(ssh[0]).toBeDefined()
 
   const pinned = await $.tool.call({ tool: FULL_TOOL, prompt: 'on main', account: 'main' } as never)
   expect(String(pinned.result)).toContain('account main')
   expect(homes[1]).toBeUndefined()
+  expect(ssh[1]).toBeUndefined()
 
   const unknown = await $.tool.call({ tool: FULL_TOOL, prompt: 'x', account: 'zz' } as never)
   expect(String(unknown.result)).toContain('no agy sign-in named "zz"')

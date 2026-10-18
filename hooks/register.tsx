@@ -364,11 +364,18 @@ const accountsOf = async ($: EngineInterface): Promise<string[]> => {
   return [...profiles, MAIN]
 }
 
+// agy saves a refreshed sign-in to the OS keychain first, which a swapped HOME has none of (macOS then pops
+// "a keychain cannot be found"), and the OS keychain is shared by every HOME anyway. agy keeps the token in a
+// file under HOME instead when it sees an SSH session, so profiles say they are one.
+const FILE_TOKEN_ENV = { SSH_CONNECTION: '127.0.0.1 0 127.0.0.1 0' }
+
 /** The env a run of this sign-in gets: nothing for `main`, the home folder pointed at the profile otherwise. */
 const envFor = async ($: EngineInterface, account: string): Promise<Record<string, string> | undefined> => {
   if (account === MAIN) return undefined
   const home = `${await profilesDirOf($)}/${account}`
-  return (await $.env.get('USERPROFILE')) ? { HOME: home, USERPROFILE: home } : { HOME: home }
+  return (await $.env.get('USERPROFILE'))
+    ? { HOME: home, USERPROFILE: home, ...FILE_TOKEN_ENV }
+    : { HOME: home, ...FILE_TOKEN_ENV }
 }
 
 /** Gemini models draw on one quota pool; Claude and GPT models in agy on another. */
