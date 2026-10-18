@@ -1,5 +1,7 @@
 # AGY for Claude (agy-bridge)
 
+English | [繁體中文](README.zh-TW.md)
+
 A Claude Code mod that lets Claude drive **Antigravity CLI (`agy`)** on the same machine as a
 sub-agent, with a live output pane in the Claude Code session. Works wherever Claude Code and agy
 are installed together: macOS, Windows, Linux. No server, no network, no token: the plugin
