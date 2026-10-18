@@ -1124,7 +1124,7 @@ export const register: Register = (on, rawOptions) => {
         used += one.length + 1
       }
       const reply = long && !isOpen ? `${kept.join('\n').trimEnd()}\n\n…` : full
-      const tail = one.text.split('\n').filter(l => l.trim()).slice(-6).join('\n')
+      const tail = tidyReply(one.text.split('\n').filter(l => l.trim()).slice(-6).join('\n'))
       const meta = [
         `${t.agentReplies}${one.account ? ` · ${t.onAccount(one.account)}` : ''}`,
         oneLive ? null : fmtElapsed((one.endedAt ?? now) - one.startedAt),
