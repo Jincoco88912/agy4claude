@@ -24,11 +24,17 @@ const MODELS = { plugin: 'agy4claude', key: 'models' } as const
 const SETTINGS_OPEN = { plugin: 'agy4claude', key: 'settingsOpen' } as const
 const EXPANDED = { plugin: 'agy4claude', key: 'expanded' } as const
 const expandedRuns = atom(EXPANDED, [] as string[])
+const settingsOpen = atom(SETTINGS_OPEN, false)
+const ACTIVITY_OPEN = { plugin: 'agy4claude', key: 'activityOpen' } as const
+const activityOpen = atom(ACTIVITY_OPEN, false)
+/** A prompt longer than this is folded to its first lines, like a long message in a chat app. */
+const ASK_LINES = 4
+const ASK_CHARS = 240
 /** A reply longer than this many lines (or characters) is folded behind a "show all" button. */
 const FOLD_LINES = 10
 const FOLD_CHARS = 700
 const frame = atom({ plugin: 'agy4claude', key: 'frame' } as const, 0)
-/** Stage frames a second while agy runs (and briefly after); idle, the robot drifts at a quarter of that. */
+/** Stage frames a second, running or standing by. */
 const FPS = 8
 
 const MAIN = 'main'
@@ -68,6 +74,7 @@ type RunInput = {
   json_schema?: string
   sandbox?: boolean
   timeout_minutes?: number
+  result?: string
 }
 
 type RawUsage = { input_tokens?: number; output_tokens?: number; thinking_tokens?: number; total_tokens?: number }
@@ -109,6 +116,8 @@ type Active = {
   job: string
   /** Absent while the run is still picking a sign-in. */
   stream: HookStream<ProcessSpawnChunk, ProcessSpawnResult> | null
+  /** The background agy's process group, once a detached launch started it. */
+  pid: number | null
   cancelled: boolean
 }
 
@@ -258,16 +267,213 @@ let agyExe = 'agy'
 let active: Active | null = null
 /** Redraws the pane each second while a run is live, so its clock moves. */
 let ticker: Timer | null = null
-/** When an SVG stage was last drawn, and the runs it drew: the stage clock runs only while one is in view. */
+/** When an SVG stage was last drawn: the stage clock runs only while one is in view. */
 let stageSeenAt = 0
-let lastRuns: AgyRun[] = []
 
-const cancelActive = async (): Promise<string | null> => {
-  if (!active) return null
-  const stopping = active
-  stopping.cancelled = true
-  await stopping.stream?.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
-  return stopping.job
+/** Jobs a hook is following right now; the background sweep leaves those to it. */
+const attached = new Set<string>()
+
+// ---- background runs ------------------------------------------------------
+// agy is started in a session of its own (perl's setsid), with its output going to files, so it
+// outlives the Claude Code turn that asked for it: an interruption kills only the follower the
+// hook reads through, and agy carries on. A sweep on the plugin's clock finishes such runs.
+
+/** Writes agy's output to files and its exit status last, so a finished run can be told from a killed one. */
+const RUNNER = '#!/bin/sh\nd="$1"; shift\n"$@" >> "$d/out" 2> "$d/err" < /dev/null\necho $? > "$d/code"\n'
+/** Starts the runner detached from the engine (own session and process group) and prints its pid. */
+const LAUNCH = 'nohup /usr/bin/perl -MPOSIX -e "POSIX::setsid(); exec @ARGV or die" -- /bin/sh "$0" "$@" >/dev/null 2>&1 & echo $!'
+/** The follower a hook waits on: one line a second while the pid lives. Killing it leaves agy alone. */
+const TICK = 'while kill -0 "$1" 2>/dev/null; do echo .; sleep 1; done'
+const SWEEP_MS = 3_000
+
+const jobsDirOf = async ($: EngineInterface): Promise<string> => {
+  const home = await homeOf($)
+  return home ? `${home}/.cache/agy4claude` : ''
+}
+
+/** Background launch needs a POSIX shell and perl (macOS, Linux); elsewhere agy runs attached as before. */
+const canDetach = async ($: EngineInterface): Promise<boolean> => {
+  try {
+    return Boolean(await jobsDirOf($)) && (await $.fs.exists('/bin/sh')) && (await $.fs.exists('/usr/bin/perl'))
+  } catch {
+    return false
+  }
+}
+
+const readText = async ($: EngineInterface, path: string): Promise<string> => {
+  try {
+    const text = await $.fs.read(path)
+    return typeof text === 'string' ? text : ''
+  } catch {
+    return ''
+  }
+}
+
+const isAlive = async ($: EngineInterface, pid: number): Promise<boolean> =>
+  (await $.process.run(['kill', '-0', String(pid)], { timeoutMs: 5_000 }).catch(() => ({ exitCode: 1 }))).exitCode === 0
+
+/** Stops a background run: its whole process group, agy and whatever it started. */
+const killJob = async ($: EngineInterface, pid: number) => {
+  await $.process.run(['kill', '-TERM', '--', `-${pid}`], { timeoutMs: 5_000 }).catch(() => undefined)
+}
+
+/** Launches agy in the background; resolves its pid and log folder. */
+const launchDetached = async ($: EngineInterface, job: string, argv: string[], cwd: string, env: Record<string, string> | undefined) => {
+  const base = await jobsDirOf($)
+  const logDir = `${base}/${job}`
+  await $.process.run(['mkdir', '-p', logDir])
+  await $.fs.write(`${logDir}/out`, '')
+  await $.fs.write(`${base}/run.sh`, RUNNER)
+  const ran = await $.process.run(['/bin/sh', '-c', LAUNCH, `${base}/run.sh`, logDir, ...argv], {
+    ...(cwd ? { cwd } : {}), ...(env ? { env } : {}), timeoutMs: 15_000,
+  })
+  const pid = Number.parseInt(ran.stdout.trim(), 10)
+  if (ran.exitCode !== 0 || !(pid > 0)) throw new Error(oneLine(ran.stderr || ran.stdout || `exit code ${ran.exitCode}`, 200))
+  return { pid, logDir }
+}
+
+/** The run as its output file tells it so far, read from the start (complete lines only, unless it is final). */
+const readJob = async ($: EngineInterface, run: AgyRun, final = false): Promise<AgyRun> => {
+  if (!run.logDir) return run
+  const out = await readText($, `${run.logDir}/out`)
+  const lines = out.split('\n')
+  if (!final) lines.pop()
+  let next: AgyRun = { ...run, steps: [], text: '' }
+  for (const line of lines) {
+    const trimmed = line.trimEnd()
+    if (trimmed) next = applyEvent(next, trimmed)
+  }
+  return next
+}
+
+/** Closes a background run that has ended: its status from the result line, else from the exit status. */
+const settleJob = async ($: EngineInterface, run: AgyRun, cancelled: boolean): Promise<{ run: AgyRun; stderr: string }> => {
+  let current = await readJob($, run, true)
+  const stderr = run.logDir ? (await readText($, `${run.logDir}/err`)).slice(-MAX_STDERR) : ''
+  const code = run.logDir ? Number.parseInt((await readText($, `${run.logDir}/code`)).trim(), 10) : Number.NaN
+  if (cancelled) {
+    current = { ...current, status: 'cancelled', error: 'cancelled from the Antigravity pane or /agy cancel' }
+  } else if (current.status !== 'done' && current.status !== 'error') {
+    const failed = code !== 0
+    current = {
+      ...current,
+      status: failed ? 'error' : 'done',
+      error: failed
+        ? `${Number.isNaN(code) ? 'agy stopped without an exit status (killed?)' : `agy exited with code ${code}`}${stderr ? `: ${oneLine(stderr, 300)}` : ''}`
+        : undefined,
+    }
+  }
+  current = { ...current, phase: undefined, endedAt: current.endedAt ?? Date.now() }
+  if (current.status === 'done' && current.usage) {
+    current = { ...current, savedUsd: savedUsd(current.usage, options.claude_price_in, options.claude_price_out) }
+  }
+  return { run: current, stderr }
+}
+
+/** What a finished run leaves behind besides its record: the conversation to continue, the savings. */
+const bookkeep = async ($: EngineInterface, run: AgyRun) => {
+  if (run.conversation) await $.state.set(LAST, run.conversation)
+  if (run.savedUsd) await addSavings($, run.savedUsd)
+}
+
+/**
+ * Follows a background run until it ends, the hook's turn is interrupted, or the deadline passes.
+ * `detached` means the turn went away and agy is still running on its own.
+ */
+const followJob = async (
+  $: EngineInterface, start: AgyRun, signal: { aborted: boolean }, me: Active | null, deadline: number,
+): Promise<{ run: AgyRun; stderr: string; detached: boolean }> => {
+  let current = start
+  attached.add(start.job)
+  const ticks = $.process.spawn({ argv: ['/bin/sh', '-c', TICK, 'sh', String(start.pid)] })
+  if (me) me.stream = ticks
+  let detached = false
+  let timedOut = false
+  try {
+    for (;;) {
+      let done = false
+      try {
+        done = Boolean((await ticks.next()).done)
+      } catch {
+        // The engine kills the follower (and throws) when the turn is interrupted; any other loss
+        // of the follower is settled from the files like an end.
+        done = true
+      }
+      if (signal.aborted && !me?.cancelled) {
+        detached = true
+        break
+      }
+      const read = await readJob($, current)
+      if (read.text !== current.text || read.steps.length !== current.steps.length || read.status !== current.status || read.phase !== current.phase) {
+        current = read
+        await saveRun($, current)
+      }
+      if (done) break
+      if (Date.now() > deadline) {
+        timedOut = true
+        await killJob($, start.pid!)
+        break
+      }
+    }
+  } finally {
+    attached.delete(start.job)
+    void ticks.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
+  }
+  if (detached) {
+    current = { ...(await readJob($, current)), detached: true }
+    await saveRun($, current)
+    if (current.conversation) await $.state.set(LAST, current.conversation)
+    return { run: current, stderr: '', detached: true }
+  }
+  const settled = await settleJob($, current, Boolean(me?.cancelled))
+  if (timedOut) settled.run = { ...settled.run, status: 'error', error: 'agy ran past its time limit and was stopped' }
+  await saveRun($, settled.run)
+  await bookkeep($, settled.run)
+  return { ...settled, detached: false }
+}
+
+/** Finishes background runs no hook is following: after an interruption, or after the plugin reloaded. */
+let sweeping = false
+const sweepJobs = async ($: EngineInterface) => {
+  if (sweeping) return
+  sweeping = true
+  try {
+    const { value: list = [] } = await $.state.get(RUNS)
+    for (const run of list) {
+      if (!isLive(run) || !run.pid || !run.logDir || attached.has(run.job)) continue
+      const ended = (await $.fs.exists(`${run.logDir}/code`).catch(() => false)) || !(await isAlive($, run.pid))
+      if (!ended) {
+        const read = { ...(await readJob($, run)), detached: true }
+        if (read.text !== run.text || read.steps.length !== run.steps.length || read.status !== run.status || !run.detached) await saveRun($, read)
+        continue
+      }
+      const { run: done } = await settleJob($, { ...run, detached: true }, false)
+      await saveRun($, done)
+      await bookkeep($, done)
+      const t = await stringsOf($)
+      $.ui.toast(t.backgroundDone(done.job, done.status))
+    }
+  } finally {
+    sweeping = false
+  }
+}
+
+const cancelActive = async ($: EngineInterface): Promise<string | null> => {
+  if (active) {
+    const stopping = active
+    stopping.cancelled = true
+    if (stopping.pid) await killJob($, stopping.pid)
+    await stopping.stream?.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
+    return stopping.job
+  }
+  // No hook holds a run: stop the newest one still going in the background.
+  const { value: list = [] } = await $.state.get(RUNS)
+  const loose = [...list].reverse().find(one => isLive(one) && one.pid && !attached.has(one.job))
+  if (!loose?.pid) return null
+  await killJob($, loose.pid)
+  const { run } = await settleJob($, loose, true)
+  await saveRun($, run)
+  return loose.job
 }
 
 /**
@@ -575,7 +781,11 @@ const STRINGS = {
     activity: 'Activity', noTools: 'No tool calls', noToolsYet: 'No tool calls yet', toolCalls: (n: number) => `${n} tool call${n === 1 ? '' : 's'}`,
     earlier: (n: number) => `${n} earlier`, waiting: 'Working on it…', noOutput: '(no output)',
     phase: { 'checking quota': 'Checking quota…', 'starting agy': 'Starting agy…', thinking: 'Thinking…', writing: 'Writing the answer…' } as Record<string, string>,
-    cancel: 'Cancel', history: 'History', showAll: 'Show the whole answer', showLess: 'Show less', claudeAsks: 'Claude asks', claudeFollows: 'Claude follows up', agentReplies: 'Gemini replies',
+    background: 'In the background', backgroundSub: 'Claude was interrupted; agy carries on',
+    backgroundDone: (job: string, status: string) => `agy: background job ${job} ${status === 'done' ? 'finished' : status}. /agy result ${job} shows the answer.`,
+    showMore: 'Show the whole ask', expand: 'Details', collapse: 'Hide',
+    cancel: 'Cancel', history: 'History', showAll: 'Show the whole answer', showLess: 'Show less', claudeAsks: 'Claude asks', claudeFollows: 'Claude follows up', agentReplies: 'Gemini',
+    chip: { plan: 'plan only', edits: 'edits only', sandbox: 'sandbox', json: 'JSON', effort: (v: string) => `effort ${v}`, limit: (n: number) => `${n} min limit`, dirs: (n: number) => `+${n} dirs` },
     emptyTitle: 'Hand work to Gemini', emptyBody: 'Ask Claude to delegate a task to agy, or type /agy <prompt>. The conversation, tool calls and answer show here.',
     justNow: 'just now', minAgo: (n: number) => `${n}m ago`, hourAgo: (n: number) => `${n}h ago`, dayAgo: (n: number) => `${n}d ago`,
     opened: 'Antigravity pane opened.', cancelled: (job: string) => `agy: cancelled job ${job}.`, nothingRunning: 'agy: nothing is running.',
@@ -597,7 +807,11 @@ const STRINGS = {
     activity: '過程', noTools: '沒有呼叫工具', noToolsYet: '尚未呼叫工具', toolCalls: (n: number) => `${n} 次工具呼叫`,
     earlier: (n: number) => `前面還有 ${n} 筆`, waiting: '正在處理…', noOutput: '(沒有輸出)',
     phase: { 'checking quota': '正在查各帳號額度…', 'starting agy': '正在啟動 agy…', thinking: '思考中…', writing: '正在整理答案…' } as Record<string, string>,
-    cancel: '取消', history: '紀錄', showAll: '看完整回答', showLess: '收起', claudeAsks: 'Claude 交辦', claudeFollows: 'Claude 接著問', agentReplies: 'Gemini 回報',
+    background: '背景執行中', backgroundSub: 'Claude 被中斷，agy 繼續跑',
+    backgroundDone: (job: string, status: string) => `agy:背景工作 ${job} ${status === 'done' ? '已完成' : status === 'error' ? '出錯了' : '已結束'}。/agy result ${job} 看答案。`,
+    showMore: '展開全文', expand: '詳細', collapse: '收起',
+    cancel: '取消', history: '紀錄', showAll: '看完整回答', showLess: '收起', claudeAsks: 'Claude 交辦', claudeFollows: 'Claude 接著問', agentReplies: 'Gemini',
+    chip: { plan: '只規劃', edits: '只改檔', sandbox: '沙盒', json: 'JSON', effort: (v: string) => `思考 ${v}`, limit: (n: number) => `上限 ${n} 分`, dirs: (n: number) => `+${n} 目錄` },
     emptyTitle: '把工作交給 Gemini', emptyBody: '請 Claude 把任務交給 agy,或輸入 /agy <題目>。對話、工具呼叫與答案都會顯示在這裡。',
     justNow: '剛剛', minAgo: (n: number) => `${n} 分鐘前`, hourAgo: (n: number) => `${n} 小時前`, dayAgo: (n: number) => `${n} 天前`,
     opened: '已開啟 Antigravity 面板。', cancelled: (job: string) => `agy:已取消 ${job}。`, nothingRunning: 'agy:目前沒有執行中的任務。',
@@ -728,15 +942,80 @@ async function saveRun($: EngineInterface, run: AgyRun) {
   await $.state.set(RUNS, list)
 }
 
+/** The tool result when the turn was interrupted while agy runs on in the background. */
+const detachedNote = (run: AgyRun): string =>
+  [
+    `agy is still running in the background: the Claude Code turn was interrupted, agy was not.`,
+    `job ${run.job} | account ${run.account}${run.conversation ? ` | conversation ${run.conversation}` : ''}`,
+    `Get its answer with ${FULL_TOOL} {"result": "${run.job}"} (waits until agy finishes), or /agy result ${run.job}.`,
+    `Stop it with /agy cancel.`,
+  ].join('\n')
+
+/** Finds a run by job id, conversation id, or the newest one for an empty id or "last". */
+const findRun = (list: AgyRun[], id: string): AgyRun | undefined => {
+  const key = id.trim()
+  if (!key || key === 'last') return list[list.length - 1]
+  return [...list].reverse().find(one => one.job === key || one.conversation === key || (one.conversation ?? '').startsWith(key))
+}
+
+/** Answers `result`: a finished run at once; a background one after waiting for it (an interruption detaches again). */
+async function fetchResult($: EngineInterface, id: string, next: { signal: { aborted: boolean } }) {
+  const { value: list = [] } = await $.state.get(RUNS)
+  let run = findRun(list, id)
+  if (!run && /^[a-z0-9]+-[a-z0-9]+$/.test(id.trim())) {
+    // Not this session's: a job started elsewhere (another session, before a restart) left its record on disk.
+    const meta = await readText($, `${await jobsDirOf($)}/${id.trim()}/meta.json`)
+    try {
+      if (meta) {
+        run = { ...(JSON.parse(meta) as AgyRun), detached: true }
+        await saveRun($, run)
+      }
+    } catch {
+      run = undefined
+    }
+  }
+  if (!run) return { result: `agy4claude: no agy run matches "${id}". Known jobs: ${list.slice(-5).map(one => one.job).join(', ') || 'none'}.` }
+  if (!isLive(run)) {
+    const stderr = run.logDir ? (await readText($, `${run.logDir}/err`)).slice(-MAX_STDERR) : ''
+    return { result: summarize(run, stderr) }
+  }
+  if (!run.pid || !run.logDir) return { result: `agy4claude: job ${run.job} is still starting; ask again shortly.` }
+  if (attached.has(run.job)) return { result: `agy4claude: job ${run.job} is still running and another call is already waiting for it.` }
+  void $.ui.open({ id: PANE, title: 'Antigravity' })
+  const minutes = 60
+  const followed = await followJob($, run, next.signal, null, Date.now() + minutes * 60_000)
+  if (followed.detached) return { result: detachedNote(followed.run) }
+  return { result: summarize(followed.run, followed.stderr) }
+}
+
+const EFFORT_SUFFIX = new RegExp(`-(${EFFORTS.join('|')})$`)
+
+/**
+ * A slug like gemini-3.8-flash-medium already names an effort, and agy rejects it next to a
+ * different --effort. The call's own effort wins (the suffix goes); a suffixed model the call
+ * named wins over the pane's effort (no --effort); otherwise the pane's effort picker wins.
+ */
+const modelAndEffort = (callModel: string, callEffort: AgyEffort | '', settings: { model: string; effort: AgyEffort | '' }): { model: string; effort: AgyEffort | '' } => {
+  const model = callModel || settings.model
+  const effort = callEffort || settings.effort
+  if (!effort || !EFFORT_SUFFIX.test(model)) return { model, effort }
+  if (callModel && !callEffort) return { model, effort: '' }
+  return { model: model.replace(EFFORT_SUFFIX, ''), effort }
+}
+
 async function runTask($: EngineInterface, input: RunInput, prompt: string, next: { signal: { aborted: boolean } }, claim: Active) {
   const cwd = String(input.cwd ?? '').trim() || options.default_cwd
   const { value: previous = null } = await $.state.get(LAST)
   const conversation = input.conversation ?? (input.continue_conversation ? previous : null) ?? null
   const jsonSchema = String(input.json_schema ?? '').trim()
+  if (conversation) {
+    const { value: known = [] } = await $.state.get(RUNS)
+    const busy = known.find(one => isLive(one) && one.conversation === conversation)
+    if (busy) return { result: `agy4claude: conversation ${conversation} is still running in the background (job ${busy.job}). Get its answer first with {"result": "${busy.job}"}.` }
+  }
   const settings = await settingsOf($)
   const launch: AgyLaunch = {
-    model: String(input.model ?? '').trim() || settings.model,
-    effort: asEffort(input.effort) || settings.effort,
+    ...modelAndEffort(String(input.model ?? '').trim(), asEffort(input.effort), settings),
     mode: asMode(input.mode),
     agent: String(input.agent ?? '').trim() || options.agent,
     project: String(input.project ?? '').trim(),
@@ -762,11 +1041,14 @@ async function runTask($: EngineInterface, input: RunInput, prompt: string, next
   const handedAt = Date.now()
   let current: AgyRun = {
     ...launch,
-    job: firstJob, account: askedAccount, prompt, cwd, conversation, status: 'starting', phase: 'checking quota', startedAt: handedAt, steps: [], text: '',
+    job: firstJob, account: askedAccount, prompt, cwd, conversation, status: 'starting', phase: 'checking quota', startedAt: handedAt, steps: [], text: '', limitMinutes: minutes,
   }
   await saveRun($, current)
   let stderr = ''
+  let bookkept = false
+  const detachable = await canDetach($)
   for (let attempt = 0; attempt < 2; attempt++) {
+    bookkept = false
     const picked = askedAccount ? { account: askedAccount } : await pickAccount($, launch.model, tried)
     if ('error' in picked) {
       if (attempt === 0) {
@@ -785,89 +1067,132 @@ async function runTask($: EngineInterface, input: RunInput, prompt: string, next
 
     current = {
       ...launch,
-      job, account, prompt, cwd, conversation, status: 'starting', phase: 'starting agy', startedAt: handedAt, steps: [], text: '',
+      job, account, prompt, cwd, conversation, status: 'starting', phase: 'starting agy', startedAt: handedAt, steps: [], text: '', limitMinutes: minutes,
     }
     const save = () => saveRun($, current)
     await save()
     $.ui.status('agy: running')
 
     const argv = argvFor({ ...launch, prompt, conversation, timeout, jsonSchema })
-    const stream = $.process.spawn({ argv, ...(cwd ? { cwd } : {}), ...(env ? { env } : {}) })
     const me = claim
     me.job = job
-    me.stream = stream
-    if (me.cancelled) await stream.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
-    ticker?.cancel()
-    ticker = $.clock.every(1000, () => $.ui.invalidate('ui.render'))
-
-    // agy's own --print-timeout is the real limit; this only catches a hung child that keeps writing.
-    const deadline = Date.now() + (minutes + 1) * 60_000
-    let buffer = ''
-    let ended: ProcessSpawnResult | undefined
-    try {
-      for (;;) {
-        const pulled = await stream.next()
-        if (pulled.done) {
-          ended = pulled.value
-          break
-        }
-        const chunk = pulled.value
-        if (chunk.stream === 'stderr') {
-          stderr = `${stderr}${chunk.text}`.slice(-MAX_STDERR)
-          continue
-        }
-        buffer += chunk.text
-        const lines = buffer.split('\n')
-        buffer = lines.pop() ?? ''
-        let changed = false
-        for (const line of lines) {
-          const trimmed = line.trimEnd()
-          if (!trimmed) continue
-          current = applyEvent(current, trimmed)
-          changed = true
-        }
-        if (changed) await save()
-        if (Date.now() > deadline) {
-          await stream.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
-          current = { ...current, status: 'error', error: `agy ran past ${minutes}m and was stopped`, endedAt: Date.now() }
-          break
-        }
-      }
-      if (buffer.trim()) current = applyEvent(current, buffer.trim())
-    } catch (error) {
-      const message = (error as Error).message ?? String(error)
-      if (current.status === 'starting') {
-        current = { ...current, status: 'error', error: `could not start agy (${agyExe}): ${message}`, endedAt: Date.now() }
-        await $.state.set(HEALTH, { ok: false, message: `agy not available (${agyExe}): ${oneLine(message, 200)}`, checkedAt: Date.now() })
-      } else {
-        current = { ...current, status: 'error', error: `agy output stream lost: ${message}`, endedAt: Date.now() }
-      }
-    } finally {
-      ticker?.cancel()
-      ticker = null
-      $.ui.status(undefined)
-    }
-
-    if (next.signal.aborted) {
-      current = { ...current, status: 'error', error: 'interrupted', endedAt: Date.now() }
-    } else if (me.cancelled) {
-      current = { ...current, status: 'cancelled', error: 'cancelled from the Antigravity pane or /agy cancel', endedAt: Date.now() }
-    } else if (ended && current.status !== 'done' && current.status !== 'error') {
-      const failed = (ended.code ?? 1) !== 0
+    if (next.signal.aborted || me.cancelled) {
       current = {
-        ...current,
-        status: failed ? 'error' : 'done',
-        error: failed
-          ? `agy exited with ${ended.code === null ? `signal ${ended.signal}` : `code ${ended.code}`}${stderr ? `: ${oneLine(stderr, 300)}` : ''}`
-          : undefined,
-        endedAt: Date.now(),
+        ...current, status: 'cancelled', phase: undefined, endedAt: Date.now(),
+        error: next.signal.aborted ? 'interrupted before agy started' : 'cancelled from the Antigravity pane or /agy cancel',
       }
+      await save()
+      break
     }
-    current = { ...current, phase: undefined, endedAt: current.endedAt ?? Date.now() }
-    if (current.status === 'done' && current.usage) {
-      current = { ...current, savedUsd: savedUsd(current.usage, options.claude_price_in, options.claude_price_out) }
+    // agy's own --print-timeout is the real limit; this only catches a hung child.
+    const deadline = Date.now() + (minutes + 1) * 60_000
+
+    if (detachable) {
+      ticker?.cancel()
+      ticker = $.clock.every(1000, () => $.ui.invalidate('ui.render'))
+      try {
+        try {
+          const { pid, logDir } = await launchDetached($, job, argv, cwd, env)
+          current = { ...current, pid, logDir }
+          me.pid = pid
+          await save()
+          // The record beside the output, so `result` finds the job from another session too.
+          await $.fs.write(`${logDir}/meta.json`, JSON.stringify({ ...current, steps: [], text: '' })).catch(() => undefined)
+          if (me.cancelled) await killJob($, pid)
+        } catch (error) {
+          const message = (error as Error).message ?? String(error)
+          current = { ...current, status: 'error', phase: undefined, error: `could not start agy (${agyExe}): ${message}`, endedAt: Date.now() }
+          await $.state.set(HEALTH, { ok: false, message: `agy not available (${agyExe}): ${oneLine(message, 200)}`, checkedAt: Date.now() })
+          await save()
+        }
+        if (current.pid) {
+          const followed = await followJob($, current, next.signal, me, deadline)
+          current = followed.run
+          stderr = followed.stderr
+          if (followed.detached) return { result: detachedNote(current) }
+          bookkept = true
+        }
+      } finally {
+        ticker?.cancel()
+        ticker = null
+        $.ui.status(undefined)
+      }
+    } else {
+      ticker?.cancel()
+      ticker = $.clock.every(1000, () => $.ui.invalidate('ui.render'))
+      const stream = $.process.spawn({ argv, ...(cwd ? { cwd } : {}), ...(env ? { env } : {}) })
+      me.stream = stream
+      if (me.cancelled) await stream.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
+      let buffer = ''
+      let ended: ProcessSpawnResult | undefined
+      try {
+        for (;;) {
+          const pulled = await stream.next()
+          if (pulled.done) {
+            ended = pulled.value
+            break
+          }
+          const chunk = pulled.value
+          if (chunk.stream === 'stderr') {
+            stderr = `${stderr}${chunk.text}`.slice(-MAX_STDERR)
+            continue
+          }
+          buffer += chunk.text
+          const lines = buffer.split('\n')
+          buffer = lines.pop() ?? ''
+          let changed = false
+          for (const line of lines) {
+            const trimmed = line.trimEnd()
+            if (!trimmed) continue
+            current = applyEvent(current, trimmed)
+            changed = true
+          }
+          if (changed) await save()
+          if (Date.now() > deadline) {
+            await stream.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
+            current = { ...current, status: 'error', error: `agy ran past ${minutes}m and was stopped`, endedAt: Date.now() }
+            break
+          }
+        }
+        if (buffer.trim()) current = applyEvent(current, buffer.trim())
+      } catch (error) {
+        const message = (error as Error).message ?? String(error)
+        if (current.status === 'starting') {
+          current = { ...current, status: 'error', error: `could not start agy (${agyExe}): ${message}`, endedAt: Date.now() }
+          await $.state.set(HEALTH, { ok: false, message: `agy not available (${agyExe}): ${oneLine(message, 200)}`, checkedAt: Date.now() })
+        } else {
+          current = { ...current, status: 'error', error: `agy output stream lost: ${message}`, endedAt: Date.now() }
+        }
+      } finally {
+        ticker?.cancel()
+        ticker = null
+        $.ui.status(undefined)
+      }
+
+      if (next.signal.aborted) {
+        current = {
+          ...current, status: 'cancelled', endedAt: Date.now(),
+          error: `interrupted: the Claude Code turn was stopped, and agy with it${current.conversation ? `. Resume it with conversation "${current.conversation}"` : ''}`,
+        }
+      } else if (me.cancelled) {
+        current = { ...current, status: 'cancelled', error: 'cancelled from the Antigravity pane or /agy cancel', endedAt: Date.now() }
+      } else if (ended && current.status !== 'done' && current.status !== 'error') {
+        const failed = (ended.code ?? 1) !== 0
+        current = {
+          ...current,
+          status: failed ? 'error' : 'done',
+          error: failed
+            ? `agy exited with ${ended.code === null ? `signal ${ended.signal}` : `code ${ended.code}`}${stderr ? `: ${oneLine(stderr, 300)}` : ''}`
+            : undefined,
+          endedAt: Date.now(),
+        }
+      }
+      current = { ...current, phase: undefined, endedAt: current.endedAt ?? Date.now() }
+      if (current.status === 'done' && current.usage) {
+        current = { ...current, savedUsd: savedUsd(current.usage, options.claude_price_in, options.claude_price_out) }
+      }
+      await save()
     }
-    await save()
 
     // Retry on the next sign-in only when agy failed before doing anything: a run that already
     // edited files or ran commands must not run again from the start.
@@ -877,8 +1202,7 @@ async function runTask($: EngineInterface, input: RunInput, prompt: string, next
     await markSpent($, account, launch.model)
   }
 
-  if (current.conversation) await $.state.set(LAST, current.conversation)
-  if (current.savedUsd) await addSavings($, current.savedUsd)
+  if (!bookkept) await bookkeep($, current)
   return { result: summarize(current, stderr) }
 }
 
@@ -892,12 +1216,14 @@ export const register: Register = (on, rawOptions) => {
       description:
         'Delegate a task to Antigravity CLI (agy, Gemini) on this machine, like a sub-agent: code, repo scans, long reading, web search and browsing (it has search_web, read_url_content and a browser). ' +
         'agy runs with permissions bypassed in the given working directory (the session directory by default) and returns its final answer. ' +
-        'Live progress is shown in the Antigravity pane. Set continue_conversation to follow up on the previous agy run.',
+        'Live progress is shown in the Antigravity pane. Set continue_conversation to follow up on the previous agy run. ' +
+        'agy keeps running in the background if this turn is interrupted; get its answer later with result (the job id the interrupted call reported, or "last").',
       isDeferred: false,
       inputSchema: {
         type: 'object',
         properties: {
-          prompt: { type: 'string', description: 'The task for agy, written as a complete instruction.' },
+          prompt: { type: 'string', description: 'The task for agy, written as a complete instruction. Leave it out when only fetching a result.' },
+          result: { type: 'string', description: 'Fetch the answer of an earlier run instead of starting one: its job id, its conversation id, or "last". A run still going in the background is waited for.' },
           account: { type: 'string', description: 'agy sign-in to use (main, or a profile name). Empty: the first one with Gemini quota left.' },
           cwd: { type: 'string', description: 'Working directory for agy. Defaults to the configured default_cwd, else the session directory.' },
           continue_conversation: { type: 'boolean', description: 'Continue the most recent agy conversation started from this session.' },
@@ -912,30 +1238,32 @@ export const register: Register = (on, rawOptions) => {
           sandbox: { type: 'boolean', description: 'Run agy in its sandbox with terminal restrictions.' },
           timeout_minutes: { type: 'number', description: `Maximum minutes to wait for agy (default ${DEFAULT_MINUTES}, at most 60).` },
         },
-        required: ['prompt'],
       },
     })
     await $.command.register({
       name: 'agy',
-      description: 'Antigravity: /agy opens the pane, /agy <prompt> runs agy, /agy usage shows quota, /agy accounts [add <name>] lists or adds sign-ins, /agy cancel stops the run',
+      description: 'Antigravity: /agy opens the pane, /agy <prompt> runs agy, /agy result [job] gets a background run\'s answer, /agy usage shows quota, /agy accounts [add <name>] lists or adds sign-ins, /agy cancel stops the run',
     })
-    // A reload ends the loops that were reading agy: close out any run still marked live.
+    // A reload ends the loops that were reading agy. A run agy carries on in the background (it has
+    // a pid) is left live for the sweep, which checks the pid and finishes it; one that never got
+    // that far is closed out.
     {
       const { value: known = [] } = await $.state.get(RUNS)
-      if (known.some(isLive)) {
-        await $.state.set(RUNS, known.map(one => (isLive(one) ? { ...one, status: 'error' as const, phase: undefined, error: 'interrupted (plugin reloaded)', endedAt: Date.now() } : one)))
+      if (known.some(one => isLive(one) && !one.pid)) {
+        await $.state.set(RUNS, known.map(one => (isLive(one) && !one.pid
+          ? { ...one, status: 'cancelled' as const, phase: undefined, error: 'interrupted (plugin reloaded)', endedAt: Date.now() }
+          : one)))
       }
     }
-    // The stage animates from here: frames step while a run is live (and briefly after one ends),
-    // a quarter as fast otherwise, and only while the pane has been drawn lately.
-    let tick = 0
+    $.clock.every(SWEEP_MS, () => { void sweepJobs($).catch(() => undefined) })
+    // Old background logs: keep a week.
+    void jobsDirOf($).then(dir => dir
+      ? $.process.run(['find', dir, '-mindepth', '1', '-maxdepth', '1', '-type', 'd', '-mtime', '+7', '-exec', 'rm', '-rf', '{}', '+'], { timeoutMs: 15_000 })
+      : undefined).catch(() => undefined)
+    // The stage animates from here, running or standing by (the robot drifts while it waits),
+    // and only while the pane has been drawn lately.
     $.clock.every(Math.round(1000 / FPS), () => {
-      tick++
       if (Date.now() - stageSeenAt > 3_000) return
-      const last = lastRuns[lastRuns.length - 1]
-      // Motion only while agy works, and for the few seconds of confetti after; otherwise the stage stands still.
-      const lively = last ? isLive(last) || (last.endedAt !== undefined && Date.now() - last.endedAt < 6_000) : false
-      if (!lively) return
       void update($, frame, n => n + 1)
     })
     const started = await next(e)
@@ -958,7 +1286,8 @@ export const register: Register = (on, rawOptions) => {
   on('tool.call', { tool: FULL_TOOL }, async ($, e, next) => {
     const input = e as unknown as RunInput
     const prompt = String(input.prompt ?? '').trim()
-    if (!prompt) return { result: 'agy4claude: prompt is required.' }
+    if (input.result !== undefined && !prompt) return await fetchResult($, String(input.result ?? ''), next)
+    if (!prompt) return { result: 'agy4claude: prompt is required (or result, to fetch an earlier run).' }
     if (active) return { result: `agy4claude: an agy run is already in progress (job ${active.job}). Wait for it, or stop it with /agy cancel.` }
     if (input.effort !== undefined && String(input.effort).trim() && !asEffort(input.effort)) {
       return { result: `agy4claude: effort must be one of ${EFFORTS.join(', ')}.` }
@@ -968,7 +1297,7 @@ export const register: Register = (on, rawOptions) => {
     }
 
     // Claim the one slot before any await: two parallel calls must not both pass the check above.
-    const claim: Active = { job: 'starting', stream: null, cancelled: false }
+    const claim: Active = { job: 'starting', stream: null, pid: null, cancelled: false }
     active = claim
     try {
       return await runTask($, input, prompt, next, claim)
@@ -1011,8 +1340,13 @@ export const register: Register = (on, rawOptions) => {
           : `${one.name}: Gemini ${fmtLeft(one.gemini.left)}${one.gemini.resetAt ? ` (${t.resets} ${one.gemini.resetAt})` : ''} · Claude/GPT ${fmtLeft(one.other.left)}`)
       return { text: `${t.usageHead}\n${lines.join('\n')}` }
     }
+    if (args === 'result' || args.startsWith('result ')) {
+      await $.ui.open({ id: PANE, title: 'Antigravity' })
+      const ran = await $.tool.call({ tool: FULL_TOOL, result: args.slice('result'.length).trim() } as never)
+      return { text: ran.deny ?? (typeof ran.result === 'string' ? ran.result : ran.text ?? '') }
+    }
     if (args === 'cancel') {
-      const job = await cancelActive()
+      const job = await cancelActive($)
       return { text: job ? t.cancelled(job) : t.nothingRunning }
     }
     await $.ui.open({ id: PANE, title: 'Antigravity' })
@@ -1033,13 +1367,13 @@ export const register: Register = (on, rawOptions) => {
     const { value: quota = null } = await $.state.get(QUOTA)
     const { value: models = [] } = await $.state.get(MODELS)
     const { value: open = false } = await $.state.get(SETTINGS_OPEN)
+    const { value: stepsOpen = false } = await $.state.get(ACTIVITY_OPEN)
     const { value: expanded = [] } = await $.state.get(EXPANDED)
     const { value: tick = 0 } = await $.state.get({ plugin: 'agy4claude', key: 'frame' } as const)
     const settings = await settingsOf($)
     const savings = await savingsOf($)
     const pool = poolOf(settings.model)
     const now = Date.now()
-    lastRuns = list
     const run = list[list.length - 1]
     const live = run ? isLive(run) : false
 
@@ -1073,7 +1407,7 @@ export const register: Register = (on, rawOptions) => {
     const toolCount = run ? run.steps.filter(s => s.type === 'tool').length : 0
     const stageStatus = !run
       ? (allSpent ? t.status.sleeping : t.status.idle)
-      : `${status.label}${run.account ? ` · ${t.onAccount(run.account)}` : ''}`
+      : `${live && run.detached ? t.background : status.label}${run.account ? ` · ${t.onAccount(run.account)}` : ''}`
     const stageSub = !run
       ? ''
       : live
@@ -1098,7 +1432,7 @@ export const register: Register = (on, rawOptions) => {
     )
     const cancelRow = live ? (
       <Box justifyContent="flex-end">
-        <Button key="cancel" variant="secondary" hotkey="c" onPress={() => { void cancelActive() }}>{t.cancel}</Button>
+        <Button key="cancel" variant="secondary" hotkey="c" onPress={() => { void cancelActive($) }}>{t.cancel}</Button>
       </Box>
     ) : null
 
@@ -1106,56 +1440,82 @@ export const register: Register = (on, rawOptions) => {
     const thread = run
       ? (run.conversation ? list.filter(one => one.conversation === run.conversation || one.job === run.job) : [run])
       : []
+    // Chat-app layout: Claude's ask on the right in its own colour, Gemini's reply on the left beside
+    // its avatar, the time and details small under each bubble; a long ask folds to its first lines.
+    const foldText = (text: string, lines: number, chars: number): { shown: string; long: boolean } => {
+      const all = text.split('\n')
+      const long = all.length > lines || text.length > chars
+      if (!long) return { shown: text, long }
+      // Fold at whole lines only, so a link or a code span is never cut in half.
+      const kept: string[] = []
+      let used = 0
+      for (const one of all) {
+        if (kept.length >= lines || (kept.length > 0 && used + one.length > chars)) break
+        kept.push(kept.length === 0 && one.length > chars ? `${one.slice(0, chars)}` : one)
+        used += one.length + 1
+      }
+      return { shown: `${kept.join('\n').trimEnd()} …`, long }
+    }
+    const foldButton = (key: string, isOpen: boolean, more: string, less: string) => (
+      <Button key={`fold-${key}`} plain
+        onPress={() => { void update($, expandedRuns, list => (list.includes(key) ? list.filter(j => j !== key) : [...list, key].slice(-20))) }}>
+        {isOpen ? less : more}
+      </Button>
+    )
     const bubble = (one: AgyRun, index: number) => {
-      const asked = index === 0 ? t.claudeAsks : t.claudeFollows
       const oneLive = isLive(one)
       const full = one.response && one.response.trim()
         ? tidyReply(one.response.length > MAX_RESULT_SHOWN ? `…\n${one.response.slice(-MAX_RESULT_SHOWN)}` : one.response)
         : ''
-      const lines = full.split('\n')
-      const long = lines.length > FOLD_LINES || full.length > FOLD_CHARS
-      const isOpen = expanded.includes(one.job)
-      // Fold at whole lines only, so a link or a code span is never cut in half.
-      const kept: string[] = []
-      let used = 0
-      for (const one of lines) {
-        if (kept.length >= FOLD_LINES || (kept.length > 0 && used + one.length > FOLD_CHARS)) break
-        kept.push(one)
-        used += one.length + 1
-      }
-      const reply = long && !isOpen ? `${kept.join('\n').trimEnd()}\n\n…` : full
-      const tail = tidyReply(one.text.split('\n').filter(l => l.trim()).slice(-6).join('\n'))
-      const meta = [
-        `${t.agentReplies}${one.account ? ` · ${t.onAccount(one.account)}` : ''}`,
-        oneLive ? null : fmtElapsed((one.endedAt ?? now) - one.startedAt),
+      const replyFold = foldText(full, FOLD_LINES, FOLD_CHARS)
+      const replyOpen = expanded.includes(one.job)
+      const reply = replyFold.long && !replyOpen ? replyFold.shown : full
+      const askKey = `ask:${one.job}`
+      const askFold = foldText(one.prompt, ASK_LINES, ASK_CHARS)
+      const askOpen = expanded.includes(askKey)
+      const tail = tidyReply(one.text.split('\n').filter(l => l.trim()).slice(-3).join('\n'))
+      const chips = [
+        one.mode === 'plan' ? t.chip.plan : one.mode === 'accept-edits' ? t.chip.edits : null,
+        one.effort ? t.chip.effort(one.effort) : null,
+        one.limitMinutes ? t.chip.limit(one.limitMinutes) : null,
+        one.agent || null,
+        one.addDirs.length ? t.chip.dirs(one.addDirs.length) : null,
+        one.sandbox ? t.chip.sandbox : null,
+        one.structured ? t.chip.json : null,
+        one.account ? `@${one.account}` : null,
+      ].filter((c): c is string => Boolean(c))
+      const replyMeta = [
+        t.agentReplies,
+        oneLive ? (one.detached ? t.background : null) : fmtElapsed((one.endedAt ?? now) - one.startedAt),
         one.savedUsd ? t.savedAbout(fmtUsd(one.savedUsd)) : null,
       ].filter(Boolean).join(' · ')
       return (
         <Box key={`turn-${one.job}`} flexDirection="column" gap={1}>
-          <Box gap={1} alignItems="flex-start">
+          <Box flexDirection="row-reverse" gap={1} alignItems="flex-start" marginLeft={6}>
             {Svg ? <Svg source={CLAUDE_AVATAR} alt="Claude" width={26} height={26} /> : <Text color="claude">✻</Text>}
-            <Box flexDirection="column" flexShrink={1}>
-              <Text size="caption" dimColor>{asked} · {fmtAgo(one.startedAt, t)}</Text>
-              <Box backgroundColor="#F6F5F3" paddingX={1}><Text color="#3F3F46" wrap="wrap">{one.prompt}</Text></Box>
+            <Box flexDirection="column" flexShrink={1} alignItems="flex-end">
+              <Text size="caption" dimColor>{index === 0 ? t.claudeAsks : t.claudeFollows} · {fmtAgo(one.startedAt, t)}</Text>
+              <Box backgroundColor="#F6F5F3" paddingX={1} flexDirection="column">
+                <Text color="#3F3F46" wrap="wrap">{askFold.long && !askOpen ? askFold.shown : one.prompt}</Text>
+              </Box>
+              {chips.length ? (
+                <Box gap={1} flexWrap="wrap" justifyContent="flex-end">
+                  {chips.map(chip => <Text key={`chip-${one.job}-${chip}`} size="caption" color="#57534E" backgroundColor="#EFEDEA"> {chip} </Text>)}
+                </Box>
+              ) : null}
+              {askFold.long ? <Box>{foldButton(askKey, askOpen, t.showMore, t.collapse)}</Box> : null}
             </Box>
           </Box>
-          <Box gap={1} alignItems="flex-start">
+          <Box gap={1} alignItems="flex-start" marginRight={6}>
             {Svg ? <Svg source={ROBOT_AVATAR} alt="Gemini" width={26} height={26} /> : <Text color="#6D5DF6">◉</Text>}
             <Box flexDirection="column" flexShrink={1} flexGrow={1}>
-              <Text size="caption" dimColor wrap="truncate">{meta}</Text>
+              <Text size="caption" dimColor wrap="truncate">{replyMeta}</Text>
               <Box flexDirection="column" borderStyle="round" borderColor={one.status === 'error' ? 'error' : '#C7D2FE'} paddingX={1}>
                 {reply
                   ? <Markdown text={reply} />
                   : <Text dimColor wrap="wrap">{oneLive ? (tail || t.waiting) : one.error ? '' : t.noOutput}</Text>}
                 {one.error ? <Text color="error" wrap="wrap">✕ {one.error}</Text> : null}
-                {long ? (
-                  <Box>
-                    <Button key={`fold-${one.job}`} plain
-                      onPress={() => { void update($, expandedRuns, list => (list.includes(one.job) ? list.filter(j => j !== one.job) : [...list, one.job].slice(-20))) }}>
-                      {isOpen ? t.showLess : t.showAll}
-                    </Button>
-                  </Box>
-                ) : null}
+                {replyFold.long ? <Box>{foldButton(one.job, replyOpen, t.showAll, t.showLess)}</Box> : null}
               </Box>
             </Box>
           </Box>
@@ -1163,23 +1523,35 @@ export const register: Register = (on, rawOptions) => {
       )
     }
 
-    // ---- activity of the newest run
+    // ---- activity of the newest run: one line by default (what agy is doing), the list on demand
     const rows = Math.max(12, e.viewport?.rows ?? 40)
-    const stepRoom = Math.max(4, Math.min(12, Math.floor(rows / 4)))
-    const shownSteps = run ? run.steps.slice(-stepRoom) : []
-    const hiddenSteps = run ? run.steps.length - shownSteps.length : 0
+    const stepRoom = Math.max(4, Math.min(10, Math.floor(rows / 4)))
+    const shownSteps = run && stepsOpen ? run.steps.slice(-stepRoom) : []
+    const hiddenSteps = run && stepsOpen ? run.steps.length - shownSteps.length : 0
+    const lastStep = run ? (doing ?? run.steps[run.steps.length - 1]) : undefined
+    const nowLine = lastStep
+      ? `${lastStep.error ? '✕' : live && lastStep.state !== 'DONE' ? '▸' : '✓'} ${lastStep.tool ?? lastStep.type}${lastStep.summary ? ` ${oneLine(lastStep.summary, 60)}` : ''}`
+      : (live ? (run?.phase ? (t.phase[run.phase] ?? `${run.phase}…`) : t.waiting) : t.noTools)
     const activity = run ? (
-      <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
-        <Box justifyContent="space-between" gap={1}>
-          {caption(t.activity)}
-          <Text size="caption" dimColor wrap="truncate">{toolCount === 0 ? (live ? t.noToolsYet : t.noTools) : t.toolCalls(toolCount)}{run.usage ? ` · ${fmtTokens(run.usage.total)} tokens` : ''}</Text>
+      <Box flexDirection="column" paddingX={1}>
+        <Box justifyContent="space-between" gap={1} alignItems="center">
+          <Box gap={1} flexShrink={1} minWidth={0}>
+            <Text size="caption" dimColor>{t.activity}</Text>
+            <Text size="caption" mono wrap="truncate" color={lastStep?.error ? 'error' : undefined}>{nowLine}</Text>
+          </Box>
+          <Box gap={1} flexShrink={0} alignItems="center">
+            <Text size="caption" dimColor>{t.toolCalls(toolCount)}{run.usage ? ` · ${fmtTokens(run.usage.total)}` : ''}</Text>
+            {run.steps.length > 0
+              ? <Button key="steps" plain onPress={() => { void update($, activityOpen, was => !was) }}>{stepsOpen ? t.collapse : t.expand}</Button>
+              : null}
+          </Box>
         </Box>
         {hiddenSteps > 0 ? <Text size="caption" dimColor>⋯ {t.earlier(hiddenSteps)}</Text> : null}
         {shownSteps.map(step => (
           <Box key={`step-${step.index}`} gap={1}>
-            <Text color={step.error ? 'error' : step.state === 'DONE' ? '#4F46E5' : '#6D5DF6'}>{step.error ? '✕' : step.state === 'DONE' ? '✓' : '▸'}</Text>
-            <Text mono weight={step.state !== 'DONE' ? 'semibold' : 'regular'}>{step.tool ?? step.type}</Text>
-            <Text dimColor wrap="truncate">{step.error ? `! ${step.error}` : step.summary ?? ''}</Text>
+            <Text size="caption" color={step.error ? 'error' : step.state === 'DONE' ? '#4F46E5' : '#6D5DF6'}>{step.error ? '✕' : step.state === 'DONE' ? '✓' : '▸'}</Text>
+            <Text size="caption" mono>{step.tool ?? step.type}</Text>
+            <Text size="caption" dimColor wrap="truncate">{step.error ? `! ${step.error}` : step.summary ?? ''}</Text>
           </Box>
         ))}
       </Box>
@@ -1226,7 +1598,7 @@ export const register: Register = (on, rawOptions) => {
       <Box flexDirection="column" backgroundColor="#F4F4F5" paddingX={1}>
         <Box justifyContent="space-between" alignItems="center" gap={1}>
           <Text size="footnote" color="#52525B" wrap="truncate">⚙ {modelName}{settings.effort ? ` · ${settings.effort}` : ''} · {t.rotShort[settings.rotation]} · {t.langShort[settings.language]}</Text>
-          <Button key="settings" plain onPress={() => { void $.state.set(SETTINGS_OPEN, !open) }}>{open ? t.close : t.settings}</Button>
+          <Button key="settings" plain onPress={() => { void update($, settingsOpen, was => !was) }}>{open ? t.close : t.settings}</Button>
         </Box>
         {open && Select ? (
           <Box flexDirection="column">
@@ -1261,9 +1633,9 @@ export const register: Register = (on, rawOptions) => {
               <Text dimColor wrap="wrap">{t.emptyBody}</Text>
             </Box>
           )}
-        {activity}
         <Box flexGrow={1} />
         {historyBox}
+        {activity}
         {settingsBar}
       </Box>
     )

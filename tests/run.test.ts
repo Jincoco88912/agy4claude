@@ -79,6 +79,10 @@ test('runs a prompt through agy, folds its stream-json output and shows the run 
     expect(await ui.find({ type: 'Text', text: /agy 1\.3\.3/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /agent_response/ })).toBeUndefined()
     expect(await ui.find({ type: 'Text', text: /1 tool call/ })).toBeDefined()
+    // Claude's ask, with its launch settings as chips under it.
+    expect(await ui.find({ type: 'Text', text: /say hi/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /5 min limit/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Claude asks/ })).toBeDefined()
     await ui.unmount()
   }
 })
@@ -386,6 +390,32 @@ test('the pane pickers set model and effort for later runs; a Claude model is ju
   expect(calls[1]![calls[1]!.indexOf('--model') + 1]).toBe('gemini-3.8-flash-low')
 })
 
+test('a model slug that already names an effort never goes to agy next to a different --effort', { options: OPTIONS }, async ($, on) => {
+  withProfiles(on, { b: 90, c: 90, main: 90 })
+  const calls: (readonly string[])[] = []
+  on('process.spawn', async function* (_$, e) {
+    calls.push(e.argv)
+    yield out(line({ event: 'result', result: { status: 'SUCCESS', response: 'ok' } }))
+    return { value: { code: 0, signal: null } }
+  })
+  await $.session.start({ cwd: '/tmp', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'agy', args: '' } as never)
+  const ui = await $.ui.mount({ plugin: 'agy4claude', surface: 'desktop', component: 'Pane', requestId: 'agy', props: PANE_PROPS })
+  await ui.press({ key: 'settings' })
+  await ui.select({ key: 'model', value: 'gemini-3.8-flash-medium' })
+  await ui.unmount()
+  const flags = (argv: readonly string[]) => ({
+    model: argv[argv.indexOf('--model') + 1],
+    effort: argv.includes('--effort') ? argv[argv.indexOf('--effort') + 1] : null,
+  })
+  // The call's effort wins over the pane model's suffix.
+  await $.tool.call({ tool: FULL_TOOL, prompt: 'x', effort: 'low' } as never)
+  expect(flags(calls[0]!)).toEqual({ model: 'gemini-3.8-flash', effort: 'low' })
+  // No effort anywhere: the slug goes as is.
+  await $.tool.call({ tool: FULL_TOOL, prompt: 'y' } as never)
+  expect(flags(calls[1]!)).toEqual({ model: 'gemini-3.8-flash-medium', effort: null })
+})
+
 test('/agy accounts add makes the profile folder and says how to sign it in', { options: OPTIONS }, async ($, on) => {
   withProfiles(on, {})
   await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
@@ -411,7 +441,7 @@ test('the Language picker switches the pane and the /agy replies to Traditional 
   await ui.unmount()
   ui = await $.ui.mount({ plugin: 'agy4claude', surface: 'desktop', component: 'Pane', requestId: 'agy', props: PANE_PROPS })
   expect(await ui.find({ type: 'Svg', alt: /完成 · 帳號 b/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /Gemini 回報/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Gemini/ })).toBeDefined()
   await ui.unmount()
   const listed = await $.command.run({ command: 'agy', args: 'accounts' } as never)
   expect(String(listed.text)).toContain('依序')
@@ -491,5 +521,102 @@ test('a long answer is folded behind a button that shows it whole', { options: O
   expect(button).toBeDefined()
   await ui.press({ key: String((button as { key?: string }).key) })
   expect(await ui.find({ type: 'Markdown', text: /line 30/ })).toBeDefined()
+  await ui.unmount()
+})
+
+/** A POSIX host with HOME, /bin/sh and perl: runs launch agy detached and are followed through files. */
+const detachedBottom = (on: On, files: Map<string, string>, runs: (readonly string[])[]) => {
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('tool.register', (_$, e) => ({ value: { tool: `mcp__agy4claude__${e.name}` } }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('fs.exists', (_$, e) => ({ value: e.path === '/bin/sh' || e.path === '/usr/bin/perl' || files.has(e.path) }))
+  on('fs.read', (_$, e) => (files.has(e.path) ? { value: files.get(e.path)! } : { deny: 'ENOENT' }))
+  on('fs.write', (_$, e) => {
+    files.set(e.path, e.text)
+    return { value: undefined }
+  })
+  on('process.run', (_$, e) => {
+    runs.push(e.argv)
+    const ok = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    if (e.argv[0] === '/bin/sh') return ok('4242\n')
+    if (e.argv[0] === 'kill') return ok('', 1)
+    return ok(e.argv.includes('--version') ? '1.4.2\n' : '')
+  })
+  mock.env(on, { HOME: '/home/u' })
+  mock.store(on)
+  mock.clock(on)
+}
+
+const JOBS = '/home/u/.cache/agy4claude'
+
+test('agy runs detached in a session of its own, is followed through its output file and settled from its exit status', { options: OPTIONS }, async ($, on) => {
+  const files = new Map<string, string>()
+  const runs: (readonly string[])[] = []
+  detachedBottom(on, files, runs)
+  const spawned: (readonly string[])[] = []
+  on('process.spawn', async function* (_$, e) {
+    spawned.push(e.argv)
+    const dir = [...files.keys()].find(k => k.endsWith('/out'))!.replace(/\/out$/, '')
+    files.set(`${dir}/out`, line({ event: 'init', conversation_id: 'conv-bg' }))
+    yield out('.\n')
+    files.set(`${dir}/out`, files.get(`${dir}/out`)! +
+      line({ event: 'step_update', step_update: { step_index: 1, state: 'DONE', step_type: 'tool', tool_info: { name: 'search_web', parameters: { query: 'x' } } } }) +
+      line({ event: 'result', result: { conversation_id: 'conv-bg', status: 'SUCCESS', response: 'found it' } }))
+    files.set(`${dir}/code`, '0\n')
+    return { value: { code: 0, signal: null } }
+  })
+  await $.session.start({ cwd: '/tmp', surface: 'desktop', isInteractive: true })
+  const ran = await $.tool.call({ tool: FULL_TOOL, prompt: 'look it up' } as never)
+  const text = String(ran.result)
+  expect(text).toContain('agy done')
+  expect(text).toContain('conversation conv-bg')
+  expect(text).toContain('found it')
+
+  // The launcher: /bin/sh starting the runner under perl's setsid, agy's argv after the log folder.
+  const launch = runs.find(argv => argv[0] === '/bin/sh')!
+  expect(launch[2]).toContain('POSIX::setsid()')
+  expect(launch[3]).toBe(`${JOBS}/run.sh`)
+  expect(launch[4]!.startsWith(`${JOBS}/`)).toBe(true)
+  expect(launch[5]).toBe('agy')
+  expect(launch[launch.length - 1]).toBe('look it up')
+  // What the hook waits on is a follower of the pid, never agy itself.
+  expect(spawned.length).toBe(1)
+  expect(spawned[0]![0]).toBe('/bin/sh')
+  expect(spawned[0]![spawned[0]!.length - 1]).toBe('4242')
+  expect(files.get(`${JOBS}/run.sh`)).toContain('echo $? > "$d/code"')
+  const meta = JSON.parse(files.get(`${launch[4]}/meta.json`)!)
+  expect(meta.pid).toBe(4242)
+
+  // Fetching it again answers from the record.
+  const again = await $.tool.call({ tool: FULL_TOOL, result: 'last' } as never)
+  expect(String(again.result)).toContain('found it')
+})
+
+test('result picks up a background job another session started, from its record on disk', { options: OPTIONS }, async ($, on) => {
+  const files = new Map<string, string>()
+  const runs: (readonly string[])[] = []
+  detachedBottom(on, files, runs)
+  const dir = `${JOBS}/abc123-wxyz`
+  files.set(`${dir}/meta.json`, JSON.stringify({
+    model: '', effort: '', mode: '', agent: '', project: '', addDirs: [], sandbox: false, structured: false,
+    job: 'abc123-wxyz', account: 'b', prompt: 'long research', cwd: '', conversation: 'conv-old', status: 'starting',
+    startedAt: 1, steps: [], text: '', pid: 777, logDir: dir,
+  }))
+  files.set(`${dir}/out`, line({ event: 'result', result: { conversation_id: 'conv-old', status: 'SUCCESS', response: 'the long answer' } }))
+  files.set(`${dir}/code`, '0\n')
+  on('process.spawn', async function* () {
+    return { value: { code: 0, signal: null } }
+  })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  const got = await $.tool.call({ tool: FULL_TOOL, result: 'abc123-wxyz' } as never)
+  expect(String(got.result)).toContain('agy done')
+  expect(String(got.result)).toContain('the long answer')
+  const missing = await $.tool.call({ tool: FULL_TOOL, result: 'nope' } as never)
+  expect(String(missing.result)).toContain('no agy run matches')
+  const ui = await $.ui.mount({ plugin: 'agy4claude', surface: 'terminal', component: 'Pane', requestId: 'agy', props: PANE_PROPS })
+  expect(await ui.find({ type: 'Markdown', text: /the long answer/ })).toBeDefined()
   await ui.unmount()
 })

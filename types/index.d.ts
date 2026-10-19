@@ -36,6 +36,8 @@ export type AgyRun = AgyLaunch & {
   /** The agy sign-in the run used: `main` (the real HOME) or a profile folder's name. */
   account: string
   prompt: string
+  /** The time limit the run was given, in minutes. */
+  limitMinutes?: number
   /** Working directory agy ran in; empty means the session's own. */
   cwd: string
   conversation: string | null
@@ -54,6 +56,12 @@ export type AgyRun = AgyLaunch & {
   numTurns?: number
   /** What the run would have cost on Claude, in US dollars (an estimate from its token usage). */
   savedUsd?: number
+  /** The background agy's process id (its own process group): set once a detached launch started it. */
+  pid?: number
+  /** Folder holding the background run's `out` (stream-json), `err` and `code` (exit status) files. */
+  logDir?: string
+  /** True once the Claude Code turn that started the run was interrupted and agy carried on alone. */
+  detached?: boolean
 }
 
 export type AgyHealth = {
@@ -110,7 +118,9 @@ declare module 'claude-code' {
       /** Bumped on the plugin's clock so the stage animates. */
       frame: number
       settingsOpen: boolean
-      /** Runs whose long reply is shown whole. */
+      /** Whether the activity list is unfolded; folded, it is one line. */
+      activityOpen: boolean
+      /** Runs whose long reply (or long prompt, keyed `ask:<job>`) is shown whole. */
       expanded: string[]
     }
   }

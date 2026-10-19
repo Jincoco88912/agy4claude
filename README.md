@@ -15,8 +15,8 @@ a live side pane.
 
 | | |
 | --- | --- |
-| **Tool** `mcp__agy4claude__run` | Claude delegates a task to agy and gets its final answer back as the tool result |
-| **Command** `/agy` | `/agy` opens the pane · `/agy <prompt>` runs agy · `/agy usage` shows quota · `/agy accounts [add <name>]` lists or adds sign-ins · `/agy cancel` stops the run |
+| **Tool** `mcp__agy4claude__run` | Claude delegates a task to agy and gets its final answer back as the tool result. agy runs in the background (macOS / Linux): if the turn is interrupted, agy keeps going, and `result` (a job id, a conversation id or `"last"`) fetches its answer later, waiting if it is still running |
+| **Command** `/agy` | `/agy` opens the pane · `/agy <prompt>` runs agy · `/agy result [job]` gets a background run's answer · `/agy usage` shows quota · `/agy accounts [add <name>]` lists or adds sign-ins · `/agy cancel` stops the run |
 | **Pane** "Antigravity" | A starry stage with a pixel robot that acts out the run, one planet per sign-in, the conversation as a chat thread, the tool calls, history, and a running "Saved" total |
 | **System prompt** | A short note telling Claude when and how to delegate, including web research |
 
