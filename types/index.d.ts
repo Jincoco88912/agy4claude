@@ -62,6 +62,15 @@ export type AgyRun = AgyLaunch & {
   logDir?: string
   /** True once the Claude Code turn that started the run was interrupted and agy carried on alone. */
   detached?: boolean
+  /** True when the run hit its time limit (agy's --print-timeout, or the plugin's own) before it finished. */
+  timedOut?: boolean
+  /** What agy had got to when it ended without an answer: its last notes, read from its transcript. */
+  partial?: string
+  /** How a plan run was kept read-only: by the agy hook, or only by asking in the prompt (no perl). */
+  readOnly?: 'hook' | 'prompt'
+  /** Seconds the model took over its finished turns, and how many, to tell a slow sign-in. */
+  modelSeconds?: number
+  modelTurns?: number
 }
 
 export type AgyHealth = {

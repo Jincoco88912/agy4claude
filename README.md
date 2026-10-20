@@ -63,6 +63,42 @@ HOME=~/.agy-profiles/work2 agy # sign in once in a terminal, then /exit
 - A run that dies of an exhausted quota **before doing anything** is retried once on the next sign-in.
   A run that already edited files or ran commands is never repeated.
 
+## Read-only runs (`mode: "plan"`)
+
+agy has no read-only switch: its own `--mode plan` only makes it write a plan first, and every run
+skips agy's permission prompts. So a plan run is made read-only by agy4claude itself:
+
+- It installs an agy `PreToolUse` hook named `agy4claude-readonly` into the sign-in's
+  `~/.gemini/config/hooks.json` (your other hooks stay as they are; the script is
+  `~/.cache/agy4claude/readonly-hook.pl`). The hook does nothing unless the run carries
+  `AGY4CLAUDE_READONLY=1`, which only plan runs do, so your own `agy` sessions are not affected.
+- In a plan run the hook lets inspection commands through — `git diff`, `log`, `show`, `status`, `grep`,
+  `blame`, `ls-files`…, `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `sed -n`, `sort`,
+  `diff`, `jq` and the like, piped or chained — and denies everything else: tests, builds, installs,
+  formatters, `git checkout` / `commit`, redirections into files, command substitution, `find -exec`,
+  `sed -i`. File edits are denied too, except agy's own plan and scratch files under `~/.gemini`.
+  agy is told why and carries on.
+- The prompt also asks agy to change nothing and to leave time for its answer.
+
+Limits: the hook needs perl (macOS and Linux have it). Elsewhere, and when `hooks.json` is not valid
+JSON, a plan run is only *asked* in its prompt to change nothing; the result header says which applied
+(`read-only (enforced by hook)` or `read-only (asked in the prompt only)`). The list of allowed commands is
+deliberately short: an inspection command it does not know is denied, and agy reads the file instead.
+Web tools and the browser stay available.
+
+## Long tasks and time limits
+
+Each agy step is one Gemini call, from a few seconds to over a minute, and a large review (a long diff,
+many files) can need dozens. Keep tasks small: name the files to read, and split a big review into
+several runs. When a run hits its `timeout_minutes`, the result says **timed out** (never "done") and
+carries what agy had got to: its last notes from its transcript and the tool calls it made, with the
+conversation id to continue from. The same goes for a run that ends without writing an answer, and for
+`result` on such a run later.
+
+agy4claude also times each model turn. A sign-in whose turns average more than 30 seconds (Google
+throttling it; a few seconds is normal) is named in the result, and runs pass it over for an hour while
+another sign-in has quota.
+
 ## Web research
 
 agy has its own web tools — `search_web` (Google search), `read_url_content` and a full browser — so
@@ -102,8 +138,8 @@ to verify anything that must be current itself.
 ## Safety notes
 
 - agy runs with `--dangerously-skip-permissions` in the working directory: it edits files and runs
-  commands without asking. Give it a clear scope, or use `mode: "plan"` (plan only) or
-  `mode: "accept-edits"` (edits, no commands).
+  commands without asking. Give it a clear scope, or use `mode: "plan"` (read-only, see above) or
+  `mode: "accept-edits"` (agy's mode for edits without commands; agy4claude does not enforce it).
 - On macOS, a sign-in folder used as `HOME` has no keychain, and agy may trigger a system dialog
   *"A keychain cannot be found to store 'antigravity'"*. Choose **Cancel** — never *Reset To Defaults*,
   which replaces your login keychain with an empty one. Runs work either way.
@@ -113,6 +149,7 @@ to verify anything that must be current itself.
 ```bash
 claude plugin validate .
 claude plugin test .
+sh tests/readonly-hook.sh
 ```
 
 The tests stand in for agy with recorded `stream-json` output, so they run without it.
@@ -121,6 +158,8 @@ The tests stand in for agy with recorded `stream-json` output, so they run witho
 | --- | --- |
 | `.claude-plugin/plugin.json` | Manifest and options |
 | `hooks/register.tsx` | Tool, commands, sign-in rotation, the run loop, the pane |
+| `hooks/readonly.ts` | The agy hook that keeps plan runs read-only (perl) |
 | `hooks/stage.ts` | The drawings: stage, robot, planets, logo, savings chip, avatars |
 | `types/index.d.ts` | `$.state` contract |
 | `tests/run.test.ts` | Plugin tests |
+| `tests/readonly-hook.sh` | Tests for the read-only hook: `sh tests/readonly-hook.sh` |

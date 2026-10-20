@@ -167,7 +167,11 @@ test('every launch option becomes the matching agy flag, defaults coming from th
   expect(argv.filter(a => a === '--add-dir').length).toBe(2)
   expect(argv).toContain('/shared/docs')
   expect(argv).not.toContain('--sandbox')
-  expect(argv[argv.length - 1]).toBe('plan it')
+  // Without perl to run the read-only hook (this host has none), a plan run is asked in its prompt.
+  const asked = String(argv?.at(-1))
+  expect(asked.endsWith('plan it')).toBe(true)
+  expect(asked).toContain('read-only run')
+  expect(String(explicit.result)).toContain('read-only (asked in the prompt only)')
   expect(String(explicit.result)).toContain('mode plan')
   expect(String(explicit.result)).toContain('json-schema')
 
@@ -525,7 +529,10 @@ test('a long answer is folded behind a button that shows it whole', { options: O
 })
 
 /** A POSIX host with HOME, /bin/sh and perl: runs launch agy detached and are followed through files. */
-const detachedBottom = (on: On, files: Map<string, string>, runs: (readonly string[])[]) => {
+const detachedBottom = (
+  on: On, files: Map<string, string>, runs: (readonly string[])[],
+  { envs, alive }: { envs?: (Record<string, string> | undefined)[]; alive?: () => boolean } = {},
+) => {
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('tool.register', (_$, e) => ({ value: { tool: `mcp__agy4claude__${e.name}` } }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
@@ -541,7 +548,11 @@ const detachedBottom = (on: On, files: Map<string, string>, runs: (readonly stri
   on('process.run', (_$, e) => {
     runs.push(e.argv)
     const ok = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
-    if (e.argv[0] === '/bin/sh') return ok('4242\n')
+    if (e.argv[0] === '/bin/sh') {
+      envs?.push(e.init?.env)
+      return ok('4242\n')
+    }
+    if (e.argv[0] === 'kill' && e.argv[1] === '-0') return ok('', alive?.() ? 0 : 1)
     if (e.argv[0] === 'kill') return ok('', 1)
     return ok(e.argv.includes('--version') ? '1.4.2\n' : '')
   })
@@ -619,4 +630,140 @@ test('result picks up a background job another session started, from its record 
   const ui = await $.ui.mount({ plugin: 'agy4claude', surface: 'terminal', component: 'Pane', requestId: 'agy', props: PANE_PROPS })
   expect(await ui.find({ type: 'Markdown', text: /the long answer/ })).toBeDefined()
   await ui.unmount()
+})
+
+const TRANSCRIPT = (conv: string, home = '/home/u') => `${home}/.gemini/antigravity-cli/brain/${conv}/.system_generated/logs/transcript.jsonl`
+const jobDirOf = (files: Map<string, string>) => [...files.keys()].find(k => k.endsWith('/out'))!.replace(/\/out$/, '')
+
+test('a run cut off by agy\'s time limit says it timed out and carries what agy had found, not "done" and a blank', { options: OPTIONS }, async ($, on) => {
+  const files = new Map<string, string>()
+  detachedBottom(on, files, [])
+  files.set(TRANSCRIPT('conv-to'), [
+    line({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', content: 'review it' }),
+    line({ step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', thinking: 'Checked tally.ts; the rounding in sumOrders looks off by one.', tool_calls: [{ name: 'read_file', args: { Path: '"/repo/core/tally.ts"' } }] }),
+    line({ step_index: 2, source: 'MODEL', type: 'GENERIC', content: 'file contents' }),
+  ].join(''))
+  on('process.spawn', async function* () {
+    const dir = jobDirOf(files)
+    files.set(`${dir}/out`, line({ event: 'init', conversation_id: 'conv-to' }) +
+      line({ event: 'step_update', step_update: { conversation_id: 'conv-to', step_index: 1, state: 'DONE', step_type: 'agent_response', duration_seconds: 4 } }) +
+      line({ event: 'step_update', step_update: { conversation_id: 'conv-to', step_index: 2, state: 'DONE', step_type: 'tool', tool_info: { name: 'read_file', parameters: { Path: '/repo/core/tally.ts' } } } }) +
+      line({ event: 'result', result: { conversation_id: 'conv-to', status: 'SUCCESS', response: '', usage: { input_tokens: 9000, output_tokens: 100, total_tokens: 9100 } } }))
+    files.set(`${dir}/err`, '[agy] print timeout after 25m0s with turn in progress; returning partial output\n')
+    files.set(`${dir}/code`, '0\n')
+    yield out('.\n')
+    return { value: { code: 0, signal: null } }
+  })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  const ran = String((await $.tool.call({ tool: FULL_TOOL, prompt: 'review it', timeout_minutes: 25 } as never)).result)
+  expect(ran).toContain('agy timed out')
+  expect(ran).not.toContain('agy done')
+  expect(ran).toContain("time limit (25m) ran out")
+  expect(ran).toContain('the rounding in sumOrders looks off by one')
+  expect(ran).toContain('→ read_file /repo/core/tally.ts')
+  expect(ran).toContain('Tool calls so far')
+  expect(ran).toContain('Split it into smaller runs')
+  expect(ran).toContain('conversation "conv-to"')
+  expect(ran).not.toContain('saved')
+  // Fetching it again gives the same, not an empty "done".
+  const again = String((await $.tool.call({ tool: FULL_TOOL, result: 'last' } as never)).result)
+  expect(again).toContain('agy timed out')
+  expect(again).toContain('looks off by one')
+})
+
+test('a "done" without an answer is an error, and the answer agy wrote into its transcript is returned', { options: OPTIONS }, async ($, on) => {
+  const files = new Map<string, string>()
+  detachedBottom(on, files, [])
+  files.set(TRANSCRIPT('conv-e'), line({ source: 'MODEL', type: 'PLANNER_RESPONSE', content: 'The review: 3 bugs, worst in tally.ts:42.' }))
+  on('process.spawn', async function* () {
+    const dir = jobDirOf(files)
+    files.set(`${dir}/out`, line({ event: 'result', result: { conversation_id: 'conv-e', status: 'SUCCESS', response: '' } }))
+    files.set(`${dir}/code`, '0\n')
+    return { value: { code: 0, signal: null } }
+  })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  const ran = String((await $.tool.call({ tool: FULL_TOOL, prompt: 'review' } as never)).result)
+  expect(ran).toContain('agy error')
+  expect(ran).toContain('agy finished without writing an answer')
+  expect(ran).toContain('The review: 3 bugs, worst in tally.ts:42.')
+})
+
+test('when the follower goes before agy does, the run is followed again instead of called killed', { options: OPTIONS }, async ($, on) => {
+  const files = new Map<string, string>()
+  let living = true
+  detachedBottom(on, files, [], { alive: () => living })
+  let follows = 0
+  on('process.spawn', async function* () {
+    follows++
+    const dir = jobDirOf(files)
+    if (follows === 1) {
+      files.set(`${dir}/out`, line({ event: 'init', conversation_id: 'conv-f' }))
+      yield out('.\n')
+      throw new Error('follower lost')
+    }
+    files.set(`${dir}/out`, files.get(`${dir}/out`)! + line({ event: 'result', result: { conversation_id: 'conv-f', status: 'SUCCESS', response: 'all reviewed' } }))
+    files.set(`${dir}/code`, '0\n')
+    living = false
+    return { value: { code: 0, signal: null } }
+  })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  const ran = String((await $.tool.call({ tool: FULL_TOOL, prompt: 'review' } as never)).result)
+  expect(follows).toBe(2)
+  expect(ran).toContain('agy done')
+  expect(ran).toContain('all reviewed')
+  expect(ran).not.toContain('killed')
+})
+
+test('a plan run is read-only: the agy hook is installed beside the user\'s own and the run carries its switch', { options: OPTIONS }, async ($, on) => {
+  const files = new Map<string, string>()
+  const runs: (readonly string[])[] = []
+  const envs: (Record<string, string> | undefined)[] = []
+  detachedBottom(on, files, runs, { envs })
+  const HOOKS = '/home/u/.gemini/config/hooks.json'
+  files.set(HOOKS, JSON.stringify({ 'my-own': { Stop: [{ type: 'command', command: 'true' }] } }))
+  on('process.spawn', async function* () {
+    const dir = jobDirOf(files)
+    files.set(`${dir}/out`, line({ event: 'result', result: { conversation_id: 'conv-p', status: 'SUCCESS', response: 'reviewed' } }))
+    files.set(`${dir}/code`, '0\n')
+    return { value: { code: 0, signal: null } }
+  })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  const ran = String((await $.tool.call({ tool: FULL_TOOL, prompt: 'review the diff', mode: 'plan' } as never)).result)
+  expect(ran).toContain('read-only (enforced by hook)')
+  expect(envs[0]?.AGY4CLAUDE_READONLY).toBe('1')
+  const hooks = JSON.parse(files.get(HOOKS)!)
+  expect(hooks['my-own']).toBeDefined()
+  const gate = hooks['agy4claude-readonly'].PreToolUse[0]
+  expect(gate.matcher).toContain('run_command')
+  expect(gate.hooks[0].command).toContain(`${JOBS}/readonly-hook.pl`)
+  expect(files.get(`${JOBS}/readonly-hook.pl`)).toContain('AGY4CLAUDE_READONLY')
+  const launch = runs.find(argv => argv[0] === '/bin/sh')!
+  expect(launch[launch.indexOf('--mode') + 1]).toBe('plan')
+  expect(launch[launch.length - 1]).toContain('read-only run')
+
+  // An ordinary run does not carry the switch, so the hook lets everything through.
+  await $.tool.call({ tool: FULL_TOOL, prompt: 'fix it' } as never)
+  expect(envs[1]?.AGY4CLAUDE_READONLY).toBeUndefined()
+})
+
+test('a sign-in whose model answers slowly is named in the result and passed over by the next run', { options: OPTIONS }, async ($, on) => {
+  withProfiles(on, { b: 80, c: 80, main: 80 })
+  const homes: (string | undefined)[] = []
+  on('process.spawn', async function* (_$, e) {
+    homes.push(e.env?.HOME)
+    const slow = homes.length === 1 ? 90 : 3
+    for (let i = 1; i <= 3; i++) {
+      yield out(line({ event: 'step_update', step_update: { conversation_id: `conv-${homes.length}`, step_index: i, state: 'DONE', step_type: 'agent_response', duration_seconds: slow } }))
+    }
+    yield out(line({ event: 'result', result: { conversation_id: `conv-${homes.length}`, status: 'SUCCESS', response: 'ok' } }))
+    return { value: { code: 0, signal: null } }
+  })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  const first = String((await $.tool.call({ tool: FULL_TOOL, prompt: 'one' } as never)).result)
+  expect(homes[0]).toBe('/Users/me/.agy-profiles/b')
+  expect(first).toContain('model ~90s per turn')
+  expect(first).toContain('sign-in b answered slowly')
+  const second = String((await $.tool.call({ tool: FULL_TOOL, prompt: 'two' } as never)).result)
+  expect(homes[1]).toBe('/Users/me/.agy-profiles/c')
+  expect(second).not.toContain('answered slowly')
 })

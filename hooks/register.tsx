@@ -1,6 +1,7 @@
 import type { ElementConstructor, EngineInterface, HookStream, ProcessSpawnChunk, ProcessSpawnResult, Register, SelectProps, SvgProps, Timer } from 'claude-code'
 import { atom, update } from 'claude-code'
 
+import { READONLY_HOOK, READONLY_HOOK_NAME, READONLY_MATCHER } from './readonly'
 import { CLAUDE_AVATAR, LOGO_SVG, ROBOT_AVATAR, fmtUsd, moodOf, savedUsd, savingsSvg, stageSvg } from './stage'
 import type { AgyAccountQuota, AgyEffort, AgyHealth, AgyLaunch, AgyMode, AgyModel, AgyPoolQuota, AgyQuota, AgyRotation, AgyRun, AgySettings, AgyStep, AgyUsage } from '../types'
 
@@ -14,6 +15,14 @@ const MAX_RESULT_SHOWN = 6_000
 const DEFAULT_MINUTES = 10
 const EFFORTS: readonly AgyEffort[] = ['low', 'medium', 'high', 'xhigh', 'max']
 const MODES: readonly AgyMode[] = ['plan', 'accept-edits']
+/** A model turn slower than this on average marks the sign-in as slow (a few seconds is normal). */
+const SLOW_TURN_S = 30
+/** How long a slow sign-in is passed over when another one has quota. */
+const SLOW_FOR_MS = 60 * 60_000
+/** Most of agy's last notes kept for a run that ended without an answer. */
+const MAX_PARTIAL = 4_000
+/** What agy prints on stderr when its --print-timeout cuts the turn short (it still reports SUCCESS). */
+const PRINT_TIMEOUT = /print timeout after (\S+)/
 
 // `$.state` refs: plugin and key are literals, as the validator asks.
 const RUNS = { plugin: 'agy4claude', key: 'runs' } as const
@@ -177,11 +186,18 @@ const oneLine = (text: string, max: number): string => {
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat
 }
 
+/** A file read's line range (read_file's StartLine / EndLine), so repeated reads of one file tell apart. */
+const lineRange = (params: Record<string, unknown>): string => {
+  const start = String(params.StartLine ?? '').replace(/"/g, '')
+  const end = String(params.EndLine ?? '').replace(/"/g, '')
+  return start || end ? `:${start || '1'}-${end}` : ''
+}
+
 const previewParams = (params: Record<string, unknown> | undefined): string => {
   if (!params) return ''
-  for (const key of ['CommandLine', 'command', 'Command', 'path', 'file_path', 'AbsolutePath', 'query', 'Query', 'url', 'Url']) {
+  for (const key of ['CommandLine', 'command', 'Command', 'path', 'Path', 'file_path', 'AbsolutePath', 'query', 'Query', 'url', 'Url']) {
     const value = params[key]
-    if (typeof value === 'string' && value) return oneLine(value, 90)
+    if (typeof value === 'string' && value) return `${oneLine(value, 90)}${lineRange(params)}`
   }
   const first = Object.values(params).find(v => typeof v === 'string' && v) as string | undefined
   return first ? oneLine(first, 90) : ''
@@ -237,6 +253,11 @@ const applyEvent = (run: AgyRun, raw: string): AgyRun => {
       next.phase = state === 'ACTIVE' ? `running ${step.tool}` : 'thinking'
     } else if (type === 'agent_response') {
       next.phase = state === 'ACTIVE' ? 'writing' : 'thinking'
+      // Each finished model turn says how long the model took: the measure of a slow sign-in.
+      if (state === 'DONE' && typeof s.duration_seconds === 'number') {
+        next.modelSeconds = (run.modelSeconds ?? 0) + s.duration_seconds
+        next.modelTurns = (run.modelTurns ?? 0) + 1
+      }
     }
     return next
   }
@@ -338,7 +359,7 @@ const readJob = async ($: EngineInterface, run: AgyRun, final = false): Promise<
   const out = await readText($, `${run.logDir}/out`)
   const lines = out.split('\n')
   if (!final) lines.pop()
-  let next: AgyRun = { ...run, steps: [], text: '' }
+  let next: AgyRun = { ...run, steps: [], text: '', modelSeconds: 0, modelTurns: 0 }
   for (const line of lines) {
     const trimmed = line.trimEnd()
     if (trimmed) next = applyEvent(next, trimmed)
@@ -363,6 +384,7 @@ const settleJob = async ($: EngineInterface, run: AgyRun, cancelled: boolean): P
         : undefined,
     }
   }
+  current = await explainEnd($, current, stderr)
   current = { ...current, phase: undefined, endedAt: current.endedAt ?? Date.now() }
   if (current.status === 'done' && current.usage) {
     current = { ...current, savedUsd: savedUsd(current.usage, options.claude_price_in, options.claude_price_out) }
@@ -370,10 +392,109 @@ const settleJob = async ($: EngineInterface, run: AgyRun, cancelled: boolean): P
   return { run: current, stderr }
 }
 
+const answerOf = (run: AgyRun): string => (run.response?.trim() ? run.response : run.text.trim() ? run.text : '')
+
+const avgTurn = (run: AgyRun): number => (run.modelTurns ? (run.modelSeconds ?? 0) / run.modelTurns : 0)
+
+/** The HOME a sign-in's agy keeps its conversations under. */
+const homeOfAccount = async ($: EngineInterface, account: string): Promise<string> =>
+  !account || account === MAIN ? homeOf($) : `${await profilesDirOf($)}/${account}`
+
+/** agy's transcript writes each tool argument JSON-encoded ("\"ls\""); this gives the plain text. */
+const plainArg = (value: unknown): string => {
+  if (typeof value !== 'string') return value == null ? '' : JSON.stringify(value)
+  if (!value.startsWith('"')) return value
+  try {
+    const decoded = JSON.parse(value) as unknown
+    return typeof decoded === 'string' ? decoded : value
+  } catch {
+    return value
+  }
+}
+
+type TranscriptRow = {
+  source?: string
+  type?: string
+  content?: string
+  thinking?: string
+  tool_calls?: { name?: string; args?: Record<string, unknown> }[]
+}
+
+/**
+ * agy's last words for a run that ended without an answer, from the conversation's transcript
+ * (brain/<conversation>/.system_generated/logs/transcript.jsonl under the sign-in's HOME): an answer it
+ * wrote that never reached the stream, else its last few thoughts and the tool calls they led to.
+ */
+const transcriptNotes = async ($: EngineInterface, run: AgyRun): Promise<string> => {
+  if (!run.conversation) return ''
+  const home = await homeOfAccount($, run.account)
+  if (!home) return ''
+  const raw = await readText($, `${home}/.gemini/antigravity-cli/brain/${run.conversation}/.system_generated/logs/transcript.jsonl`)
+  const turns: TranscriptRow[] = []
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue
+    try {
+      const row = JSON.parse(line) as TranscriptRow
+      if (row.source === 'MODEL' && row.type === 'PLANNER_RESPONSE') turns.push(row)
+    } catch {
+      // A line still being written.
+    }
+  }
+  const last = turns[turns.length - 1]
+  if (!last) return ''
+  // A last turn with words and no tool call is the answer itself.
+  if (last.content?.trim() && !last.tool_calls?.length) return last.content.trim().slice(-MAX_PARTIAL)
+  const notes = turns.slice(-4).map(turn => {
+    const said = oneLine(turn.content?.trim() || turn.thinking?.trim() || '', 600)
+    const calls = (turn.tool_calls ?? []).map(call => {
+      const args = call.args ?? {}
+      const what = ['CommandLine', 'Path', 'AbsolutePath', 'Query', 'Url', 'query', 'url'].map(key => plainArg(args[key])).find(Boolean) ?? ''
+      return `${call.name ?? 'tool'}${what ? ` ${oneLine(what, 120)}${lineRange(args)}` : ''}`
+    })
+    return [said ? `- ${said}` : '', ...calls.map(call => `  → ${call}`)].filter(Boolean).join('\n')
+  }).filter(Boolean)
+  if (!notes.length) return ''
+  return `agy's last notes (from its transcript; it had not written an answer):\n${notes.join('\n')}`.slice(0, MAX_PARTIAL)
+}
+
+/**
+ * Names how a run ended when agy's own result does not: a time limit hit (agy still says SUCCESS), or a
+ * "done" with no answer. Either way it adds what agy had got to, so the caller is never handed a blank.
+ */
+const explainEnd = async ($: EngineInterface, run: AgyRun, stderr: string): Promise<AgyRun> => {
+  if (run.status === 'cancelled') return run
+  let next = run
+  const limit = PRINT_TIMEOUT.exec(stderr)
+  if (limit) {
+    next = {
+      ...next, status: 'error', timedOut: true,
+      error: `timed out: agy's time limit (${limit[1]!.replace(/(\d+[hm])0s$/, '$1')}) ran out with the turn still in progress${answerOf(next) ? '' : ', before it wrote an answer'}`,
+    }
+  } else if (next.status === 'done' && !answerOf(next)) {
+    next = { ...next, status: 'error', error: 'agy finished without writing an answer' }
+  }
+  if (!answerOf(next) && next.partial === undefined) next = { ...next, partial: await transcriptNotes($, next) }
+  return next
+}
+
+type SlowMarks = Record<string, { until: number; avg: number }>
+
+/** Remembers a sign-in whose model answered slowly (Google throttling it, likely), or clears the mark. */
+const noteSpeed = async ($: EngineInterface, run: AgyRun) => {
+  if (!run.account || (run.modelTurns ?? 0) < 3) return
+  const marks = { ...(((await $.store.get('slowAccounts')) ?? {}) as SlowMarks) }
+  const avg = avgTurn(run)
+  if (avg > SLOW_TURN_S) marks[run.account] = { until: Date.now() + SLOW_FOR_MS, avg: Math.round(avg) }
+  else if (marks[run.account]) delete marks[run.account]
+  else return
+  await $.store.set('slowAccounts', marks)
+}
+
 /** What a finished run leaves behind besides its record: the conversation to continue, the savings. */
 const bookkeep = async ($: EngineInterface, run: AgyRun) => {
   if (run.conversation) await $.state.set(LAST, run.conversation)
   if (run.savedUsd) await addSavings($, run.savedUsd)
+  await noteSpeed($, run)
 }
 
 /**
@@ -385,7 +506,8 @@ const followJob = async (
 ): Promise<{ run: AgyRun; stderr: string; detached: boolean }> => {
   let current = start
   attached.add(start.job)
-  const ticks = $.process.spawn({ argv: ['/bin/sh', '-c', TICK, 'sh', String(start.pid)] })
+  const follow = () => $.process.spawn({ argv: ['/bin/sh', '-c', TICK, 'sh', String(start.pid)] })
+  let ticks = follow()
   if (me) me.stream = ticks
   let detached = false
   let timedOut = false
@@ -395,8 +517,7 @@ const followJob = async (
       try {
         done = Boolean((await ticks.next()).done)
       } catch {
-        // The engine kills the follower (and throws) when the turn is interrupted; any other loss
-        // of the follower is settled from the files like an end.
+        // The engine kills the follower (and throws) when the turn is interrupted.
         done = true
       }
       if (signal.aborted && !me?.cancelled) {
@@ -408,7 +529,22 @@ const followJob = async (
         current = read
         await saveRun($, current)
       }
-      if (done) break
+      if (done) {
+        // The follower can end before agy does (the engine ended it, or it lost its pipe): agy has ended
+        // only once it wrote its exit status or its pid is gone. Otherwise follow it again.
+        const ended = me?.cancelled || (await $.fs.exists(`${start.logDir}/code`).catch(() => false)) || !(await isAlive($, start.pid!))
+        if (ended) break
+        if (Date.now() > deadline) {
+          timedOut = true
+          await killJob($, start.pid!)
+          break
+        }
+        void ticks.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
+        await $.process.run(['sleep', '1'], { timeoutMs: 5_000 }).catch(() => undefined)
+        ticks = follow()
+        if (me) me.stream = ticks
+        continue
+      }
       if (Date.now() > deadline) {
         timedOut = true
         await killJob($, start.pid!)
@@ -426,7 +562,12 @@ const followJob = async (
     return { run: current, stderr: '', detached: true }
   }
   const settled = await settleJob($, current, Boolean(me?.cancelled))
-  if (timedOut) settled.run = { ...settled.run, status: 'error', error: 'agy ran past its time limit and was stopped' }
+  if (timedOut) {
+    settled.run = {
+      ...settled.run, status: 'error', timedOut: true, savedUsd: undefined,
+      error: `timed out: agy ran past its time limit (${start.limitMinutes ?? '?'} min) and was stopped`,
+    }
+  }
   await saveRun($, settled.run)
   await bookkeep($, settled.run)
   return { ...settled, detached: false }
@@ -651,16 +792,20 @@ const pickAccount = async ($: EngineInterface, model: string, skip: string[] = [
     if (unknown) return { account: unknown }
     return { error: `every agy sign-in is out of ${pool === 'gemini' ? 'Gemini' : 'Claude/GPT'} quota (${fmtQuota(quota, pool)}); /agy usage shows when they reset` }
   }
+  // A sign-in that answered slowly of late is passed over while another one can take the run.
+  const marks = ((await $.store.get('slowAccounts')) ?? {}) as SlowMarks
+  const brisk = usable.filter(name => !((marks[name]?.until ?? 0) > Date.now()))
+  const ready = brisk.length ? brisk : usable
   const { rotation } = await settingsOf($)
-  if (rotation === 'random') return { account: usable[Math.floor(Math.random() * usable.length)]! }
-  if (rotation === 'most-left') return { account: [...usable].sort((x, y) => left(y) - left(x))[0]! }
+  if (rotation === 'random') return { account: ready[Math.floor(Math.random() * ready.length)]! }
+  if (rotation === 'most-left') return { account: [...ready].sort((x, y) => left(y) - left(x))[0]! }
   if (rotation === 'round-robin') {
     const last = String((await $.store.get('lastAccount')) ?? '')
     const after = all.indexOf(last)
-    const next = [...all.slice(after + 1), ...all.slice(0, after + 1)].find(name => usable.includes(name))
-    return { account: next ?? usable[0]! }
+    const next = [...all.slice(after + 1), ...all.slice(0, after + 1)].find(name => ready.includes(name))
+    return { account: next ?? ready[0]! }
   }
-  return { account: usable[0]! }
+  return { account: ready[0]! }
 }
 
 /** Marks a sign-in's pool as spent after agy reported it out of quota, so the next pick skips it. */
@@ -699,6 +844,51 @@ const loadModels = async ($: EngineInterface): Promise<AgyModel[]> => {
       .map(cols => ({ value: cols[0]!.trim(), label: cols[1]!.trim() }))
   } catch {
     return []
+  }
+}
+
+// ---- plan runs are read-only ------------------------------------------------
+// agy has no read-only flag: its --mode plan only makes it plan first, and runs skip every permission
+// prompt. So a plan run carries AGY4CLAUDE_READONLY=1, and an agy PreToolUse hook installed in the
+// sign-in's ~/.gemini/config/hooks.json denies anything but inspection commands (see readonly.ts).
+// Without perl (Windows) the run is only asked, in its prompt, to change nothing.
+
+const READONLY_ENV = 'AGY4CLAUDE_READONLY'
+const READONLY_NOTE =
+  'This is a read-only run: inspect and report only. Do not edit or create files, and do not run tests, builds, installs, ' +
+  'formatters or any command that changes something (they are blocked); read the code instead and say what you would run. ' +
+  'Leave time to write your answer: once you have enough, stop looking and answer.\n\n'
+
+/** Makes sure the read-only hook is in place for this sign-in; false when it cannot be (no perl, a hooks.json it cannot read). */
+const prepareReadOnly = async ($: EngineInterface, account: string): Promise<boolean> => {
+  try {
+    if (!(await canDetach($))) return false
+    const script = `${await jobsDirOf($)}/readonly-hook.pl`
+    if ((await readText($, script)) !== READONLY_HOOK) {
+      await $.process.run(['mkdir', '-p', await jobsDirOf($)])
+      await $.fs.write(script, READONLY_HOOK)
+    }
+    const home = await homeOfAccount($, account)
+    if (!home) return false
+    const dir = `${home}/.gemini/config`
+    const path = `${dir}/hooks.json`
+    const raw = await readText($, path)
+    let hooks: Record<string, unknown> = {}
+    if (raw.trim()) {
+      const parsed = JSON.parse(raw) as unknown
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false
+      hooks = parsed as Record<string, unknown>
+    }
+    const entry = {
+      PreToolUse: [{ matcher: READONLY_MATCHER, hooks: [{ type: 'command', command: `/usr/bin/perl '${script}'`, timeout: 10 }] }],
+    }
+    if (JSON.stringify(hooks[READONLY_HOOK_NAME]) === JSON.stringify(entry)) return true
+    await $.process.run(['mkdir', '-p', dir])
+    await $.fs.write(path, `${JSON.stringify({ ...hooks, [READONLY_HOOK_NAME]: entry }, null, 2)}\n`)
+    return true
+  } catch {
+    // A hooks.json that is not JSON is left alone: the run falls back to asking.
+    return false
   }
 }
 
@@ -748,20 +938,43 @@ const launchTags = (run: AgyLaunch): string[] => [
   run.structured ? 'json-schema' : '',
 ].filter(Boolean)
 
+/** The tool calls a run made, newest last: what it had looked at when it ended without an answer. */
+const seenSoFar = (run: AgyRun): string => {
+  const tools = run.steps.filter(s => s.type === 'tool')
+  if (!tools.length) return ''
+  const shown = tools.slice(-20).map(s => `- ${s.tool}${s.summary ? ` ${s.summary}` : ''}${s.error ? ` (failed: ${s.error})` : ''}`)
+  const more = tools.length > shown.length ? ` (last ${shown.length} of ${tools.length})` : ''
+  return `Tool calls so far${more}:\n${shown.join('\n')}`
+}
+
 const summarize = (run: AgyRun, stderr: string): string => {
   const seconds = Math.round(((run.endedAt ?? Date.now()) - run.startedAt) / 1000)
   const toolsUsed = [...new Set(run.steps.filter(s => s.type === 'tool').map(s => s.tool).filter(Boolean))]
+  const avg = avgTurn(run)
   const header = [
-    `agy ${run.status} in ${seconds}s`,
+    `agy ${run.timedOut ? 'timed out' : run.status} in ${seconds}s`,
     `account ${run.account}`,
     run.conversation ? `conversation ${run.conversation}` : null,
     ...launchTags(run),
+    run.readOnly ? `read-only (${run.readOnly === 'hook' ? 'enforced by hook' : 'asked in the prompt only'})` : null,
     toolsUsed.length ? `tools: ${toolsUsed.join(', ')}` : null,
     run.usage ? `${run.usage.total} tokens` : null,
+    (run.modelTurns ?? 0) >= 2 ? `model ~${Math.round(avg)}s per turn` : null,
   ].filter(Boolean).join(' | ')
-  const body = run.response ?? run.text
-  const extra = stderr && !(run.error ?? '').includes(stderr.slice(0, 20)) ? `\nstderr: ${oneLine(stderr, 500)}` : ''
-  const tail = run.error ? `\n\nERROR: ${run.error}${extra}` : ''
+  const answer = answerOf(run)
+  const body = answer || [run.partial || '(agy wrote no answer and left no notes in its transcript)', seenSoFar(run)].filter(Boolean).join('\n\n')
+  const extra = stderr && !run.timedOut && !(run.error ?? '').includes(stderr.slice(0, 20)) ? `\nstderr: ${oneLine(stderr, 500)}` : ''
+  const notes = [
+    run.timedOut
+      ? 'Tip: the task was too big for the time it had. Split it into smaller runs (a few files or one question each), or give a larger timeout_minutes; ' +
+        (run.conversation ? `continue with conversation "${run.conversation}" and ask for the answer from what it found so far.` : 'then run it again.')
+      : '',
+    (run.modelTurns ?? 0) >= 3 && avg > SLOW_TURN_S
+      ? `Note: sign-in ${run.account} answered slowly (~${Math.round(avg)}s per model turn; a few seconds is normal), likely Google throttling it. ` +
+        'Runs prefer another sign-in for the next hour; pass account to choose one.'
+      : '',
+  ].filter(Boolean)
+  const tail = `${run.error ? `\n\nERROR: ${run.error}${extra}` : ''}${notes.length ? `\n\n${notes.join('\n')}` : ''}`
   return `${header}\n\n${body}${tail}`
 }
 
@@ -785,7 +998,7 @@ const STRINGS = {
     backgroundDone: (job: string, status: string) => `agy: background job ${job} ${status === 'done' ? 'finished' : status}. /agy result ${job} shows the answer.`,
     showMore: 'Show the whole ask', expand: 'Details', collapse: 'Hide',
     cancel: 'Cancel', history: 'History', showAll: 'Show the whole answer', showLess: 'Show less', claudeAsks: 'Claude asks', claudeFollows: 'Claude follows up', agentReplies: 'Gemini',
-    chip: { plan: 'plan only', edits: 'edits only', sandbox: 'sandbox', json: 'JSON', effort: (v: string) => `effort ${v}`, limit: (n: number) => `${n} min limit`, dirs: (n: number) => `+${n} dirs` },
+    chip: { plan: 'read-only', edits: 'edits only', sandbox: 'sandbox', json: 'JSON', effort: (v: string) => `effort ${v}`, limit: (n: number) => `${n} min limit`, dirs: (n: number) => `+${n} dirs` },
     emptyTitle: 'Hand work to Gemini', emptyBody: 'Ask Claude to delegate a task to agy, or type /agy <prompt>. The conversation, tool calls and answer show here.',
     justNow: 'just now', minAgo: (n: number) => `${n}m ago`, hourAgo: (n: number) => `${n}h ago`, dayAgo: (n: number) => `${n}d ago`,
     opened: 'Antigravity pane opened.', cancelled: (job: string) => `agy: cancelled job ${job}.`, nothingRunning: 'agy: nothing is running.',
@@ -811,7 +1024,7 @@ const STRINGS = {
     backgroundDone: (job: string, status: string) => `agy:背景工作 ${job} ${status === 'done' ? '已完成' : status === 'error' ? '出錯了' : '已結束'}。/agy result ${job} 看答案。`,
     showMore: '展開全文', expand: '詳細', collapse: '收起',
     cancel: '取消', history: '紀錄', showAll: '看完整回答', showLess: '收起', claudeAsks: 'Claude 交辦', claudeFollows: 'Claude 接著問', agentReplies: 'Gemini',
-    chip: { plan: '只規劃', edits: '只改檔', sandbox: '沙盒', json: 'JSON', effort: (v: string) => `思考 ${v}`, limit: (n: number) => `上限 ${n} 分`, dirs: (n: number) => `+${n} 目錄` },
+    chip: { plan: '唯讀', edits: '只改檔', sandbox: '沙盒', json: 'JSON', effort: (v: string) => `思考 ${v}`, limit: (n: number) => `上限 ${n} 分`, dirs: (n: number) => `+${n} 目錄` },
     emptyTitle: '把工作交給 Gemini', emptyBody: '請 Claude 把任務交給 agy,或輸入 /agy <題目>。對話、工具呼叫與答案都會顯示在這裡。',
     justNow: '剛剛', minAgo: (n: number) => `${n} 分鐘前`, hourAgo: (n: number) => `${n} 小時前`, dayAgo: (n: number) => `${n} 天前`,
     opened: '已開啟 Antigravity 面板。', cancelled: (job: string) => `agy:已取消 ${job}。`, nothingRunning: 'agy:目前沒有執行中的任務。',
@@ -912,7 +1125,10 @@ const DELEGATION_GUIDE =
   'Treat it as a sub-agent: hand it a self-contained coding task when the user asks to delegate to agy or Antigravity, ' +
   'wants a second implementation or opinion from it, or wants work to proceed in parallel while you continue. ' +
   'Write the prompt as a complete instruction with the paths it needs; it runs with permissions bypassed in the given working directory. ' +
-  'Use mode "plan" when only a plan or review is wanted and nothing should change; "accept-edits" when it may edit files but should not run commands. ' +
+  'Use mode "plan" when only a plan, review or research is wanted and nothing should change: it is read-only (inspection commands such as git diff and grep run; edits, tests and builds are blocked). ' +
+  '"accept-edits" when it may edit files but should not run commands. ' +
+  'Each agy step can take from a few seconds to over a minute, so keep a task small: split a large review (a long diff, many files) into several runs of a few files each, ' +
+  'and say which files to read rather than asking it to explore. A run that hits its time limit returns what agy had found so far. ' +
   'Use json_schema when you will parse its answer. ' +
   'Besides files and commands, agy has its own tools for the web: search_web (Google search), read_url_content (reads a page) and a full browser ' +
   '(open, click, type, scroll, screenshot, run JavaScript), so web research, reading long pages and checking a site can be delegated too. ' +
@@ -977,6 +1193,11 @@ async function fetchResult($: EngineInterface, id: string, next: { signal: { abo
   if (!run) return { result: `agy4claude: no agy run matches "${id}". Known jobs: ${list.slice(-5).map(one => one.job).join(', ') || 'none'}.` }
   if (!isLive(run)) {
     const stderr = run.logDir ? (await readText($, `${run.logDir}/err`)).slice(-MAX_STDERR) : ''
+    if (!answerOf(run) && !run.partial) {
+      // A record from before the plugin read transcripts, or one agy has written to since: look again.
+      run = { ...run, partial: await transcriptNotes($, run) }
+      if (run.partial) await saveRun($, run)
+    }
     return { result: summarize(run, stderr) }
   }
   if (!run.pid || !run.logDir) return { result: `agy4claude: job ${run.job} is still starting; ask again shortly.` }
@@ -1061,19 +1282,22 @@ async function runTask($: EngineInterface, input: RunInput, prompt: string, next
     tried.push(account)
     await $.store.set('lastAccount', account)
     await shareGitConfig($, account)
-    const env = await envFor($, account)
+    const readOnly = launch.mode === 'plan' ? ((await prepareReadOnly($, account)) ? 'hook' as const : 'prompt' as const) : undefined
+    const accountEnv = await envFor($, account)
+    const env = readOnly ? { ...(accountEnv ?? {}), [READONLY_ENV]: '1' } : accountEnv
     stderr = ''
     const job = attempt === 0 ? firstJob : newJob()
 
     current = {
       ...launch,
       job, account, prompt, cwd, conversation, status: 'starting', phase: 'starting agy', startedAt: handedAt, steps: [], text: '', limitMinutes: minutes,
+      ...(readOnly ? { readOnly } : {}),
     }
     const save = () => saveRun($, current)
     await save()
     $.ui.status('agy: running')
 
-    const argv = argvFor({ ...launch, prompt, conversation, timeout, jsonSchema })
+    const argv = argvFor({ ...launch, prompt: readOnly ? `${READONLY_NOTE}${prompt}` : prompt, conversation, timeout, jsonSchema })
     const me = claim
     me.job = job
     if (next.signal.aborted || me.cancelled) {
@@ -1150,7 +1374,7 @@ async function runTask($: EngineInterface, input: RunInput, prompt: string, next
           if (changed) await save()
           if (Date.now() > deadline) {
             await stream.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
-            current = { ...current, status: 'error', error: `agy ran past ${minutes}m and was stopped`, endedAt: Date.now() }
+            current = { ...current, status: 'error', timedOut: true, error: `timed out: agy ran past its time limit (${minutes} min) and was stopped`, endedAt: Date.now() }
             break
           }
         }
@@ -1187,6 +1411,7 @@ async function runTask($: EngineInterface, input: RunInput, prompt: string, next
           endedAt: Date.now(),
         }
       }
+      current = await explainEnd($, current, stderr)
       current = { ...current, phase: undefined, endedAt: current.endedAt ?? Date.now() }
       if (current.status === 'done' && current.usage) {
         current = { ...current, savedUsd: savedUsd(current.usage, options.claude_price_in, options.claude_price_out) }
@@ -1230,13 +1455,13 @@ export const register: Register = (on, rawOptions) => {
           conversation: { type: 'string', description: 'An explicit agy conversation id to resume.' },
           model: { type: 'string', description: 'agy --model slug; empty uses the configured default.' },
           effort: { type: 'string', enum: [...EFFORTS], description: 'Reasoning effort for this run; empty uses the configured default.' },
-          mode: { type: 'string', enum: [...MODES], description: '"plan": agy only plans, changes nothing. "accept-edits": agy may edit files but not run commands. Empty: full access.' },
+          mode: { type: 'string', enum: [...MODES], description: '"plan": read-only (reviews, research, plans): agy may read files and run inspection commands such as git diff, grep or ls; edits, tests, builds and installs are blocked. "accept-edits": agy may edit files but not run commands. Empty: full access.' },
           agent: { type: 'string', description: 'Name of an agent defined in agy (see `agy agents`) to run the task with.' },
           project: { type: 'string', description: 'agy project id or name for this run.' },
           add_dirs: { type: 'array', items: { type: 'string' }, description: 'Extra directories agy may read and edit besides cwd.' },
           json_schema: { type: 'string', description: 'A JSON schema (as JSON text, or a path to a schema file) the final answer must conform to.' },
           sandbox: { type: 'boolean', description: 'Run agy in its sandbox with terminal restrictions.' },
-          timeout_minutes: { type: 'number', description: `Maximum minutes to wait for agy (default ${DEFAULT_MINUTES}, at most 60).` },
+          timeout_minutes: { type: 'number', description: `Maximum minutes agy may take (default ${DEFAULT_MINUTES}, at most 60). When it runs out, the result says so and carries what agy had found.` },
         },
       },
     })
@@ -1464,8 +1689,9 @@ export const register: Register = (on, rawOptions) => {
     )
     const bubble = (one: AgyRun, index: number) => {
       const oneLive = isLive(one)
-      const full = one.response && one.response.trim()
-        ? tidyReply(one.response.length > MAX_RESULT_SHOWN ? `…\n${one.response.slice(-MAX_RESULT_SHOWN)}` : one.response)
+      const said = one.response?.trim() ? one.response : (one.partial ?? '')
+      const full = said.trim()
+        ? tidyReply(said.length > MAX_RESULT_SHOWN ? `…\n${said.slice(-MAX_RESULT_SHOWN)}` : said)
         : ''
       const replyFold = foldText(full, FOLD_LINES, FOLD_CHARS)
       const replyOpen = expanded.includes(one.job)
