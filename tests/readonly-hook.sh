@@ -12,11 +12,11 @@ fails=0
 # expect <allow|deny|none> <tool> <json args>
 expect() {
   want=$1 tool=$2 args=$3
-  got=$(printf '{"toolCall":{"name":"%s","args":%s}}' "$tool" "$args" | HOME=/home/u AGY4CLAUDE_READONLY=${RO-1} perl "$tmp/hook.pl")
+  got=$(printf '{"toolCall":{"name":"%s","args":%s}}' "$tool" "$args" | HOME=/home/u AGY4CLAUDE_READONLY=${RO-1} AGY4CLAUDE_NO_COMMANDS=${NC-0} perl "$tmp/hook.pl")
   case $got in
     *'"decision":"allow"'*) d=allow ;;
     *'"decision":"deny"'*) d=deny ;;
-    '{}') d=none ;;
+    '') d=none ;;
     *) d="?($got)" ;;
   esac
   if [ "$d" != "$want" ]; then echo "FAIL: $tool $args -> $d, want $want"; fails=$((fails + 1)); fi
@@ -69,5 +69,17 @@ expect deny replace_file_content '{"TargetFile":"/home/u/.gemini/../repo/a.ts"}'
 expect allow write_to_file '{"TargetFile":"/home/u/.gemini/antigravity-cli/brain/c1/plan.md"}'
 expect none view_file '{"AbsolutePath":"/repo/a.ts"}'
 RO=0 expect none run_command '{"CommandLine":"rm -rf build"}'
+RO=0 expect none write_to_file '{"TargetFile":"/repo/src/a.ts"}'
+
+# Mode accept-edits (AGY4CLAUDE_NO_COMMANDS=1): every command is denied, edits and reads go through.
+RO=0 NC=1 expect deny run_command '{"CommandLine":"touch made.txt"}'
+RO=0 NC=1 expect deny run_command '{"CommandLine":"ls"}'
+RO=0 NC=1 expect deny send_command_input '{"CommandId":"c1","Input":"y"}'
+RO=0 NC=1 expect none write_to_file '{"TargetFile":"/repo/src/a.ts","CodeContent":"x"}'
+RO=0 NC=1 expect none replace_file_content '{"TargetFile":"/repo/src/a.ts"}'
+RO=0 NC=1 expect none view_file '{"AbsolutePath":"/repo/a.ts"}'
+# With neither switch the hook says nothing at all: agy reads a bare {} as a denial (checked 2026-10-20).
+raw=$(printf '{"toolCall":{"name":"run_command","args":{"CommandLine":"ls"}}}' | HOME=/home/u AGY4CLAUDE_READONLY=0 AGY4CLAUDE_NO_COMMANDS=0 perl "$tmp/hook.pl")
+[ -z "$raw" ] || { echo "FAIL: the idle hook printed '$raw'"; fails=$((fails + 1)); }
 
 if [ "$fails" -eq 0 ]; then echo "readonly hook: all cases pass"; else echo "readonly hook: $fails failed"; exit 1; fi

@@ -746,6 +746,34 @@ test('a plan run is read-only: the agy hook is installed beside the user\'s own 
   expect(envs[1]?.AGY4CLAUDE_READONLY).toBeUndefined()
 })
 
+test('an accept-edits run may not run commands: the hook is installed and the run carries its switch', { options: OPTIONS }, async ($, on) => {
+  const files = new Map<string, string>()
+  const runs: (readonly string[])[] = []
+  const envs: (Record<string, string> | undefined)[] = []
+  detachedBottom(on, files, runs, { envs })
+  on('process.spawn', async function* () {
+    const dir = jobDirOf(files)
+    files.set(`${dir}/out`, line({ event: 'result', result: { conversation_id: 'conv-e', status: 'SUCCESS', response: 'edited' } }))
+    files.set(`${dir}/code`, '0\n')
+    return { value: { code: 0, signal: null } }
+  })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  const ran = String((await $.tool.call({ tool: FULL_TOOL, prompt: 'rename foo to bar', mode: 'accept-edits' } as never)).result)
+  expect(ran).toContain('no commands (enforced by hook)')
+  expect(envs[0]?.AGY4CLAUDE_NO_COMMANDS).toBe('1')
+  expect(envs[0]?.AGY4CLAUDE_READONLY).toBeUndefined()
+  const hooks = JSON.parse(files.get('/home/u/.gemini/config/hooks.json')!)
+  expect(hooks['agy4claude-readonly'].PreToolUse[0].matcher).toContain('send_command_input')
+  expect(files.get(`${JOBS}/readonly-hook.pl`)).toContain('AGY4CLAUDE_NO_COMMANDS')
+  const launch = runs.find(argv => argv[0] === '/bin/sh')!
+  expect(launch[launch.indexOf('--mode') + 1]).toBe('accept-edits')
+  expect(launch[launch.length - 1]).toContain('may not run commands')
+
+  // An ordinary run carries neither switch.
+  await $.tool.call({ tool: FULL_TOOL, prompt: 'fix it' } as never)
+  expect(envs[1]?.AGY4CLAUDE_NO_COMMANDS).toBeUndefined()
+})
+
 test('a sign-in whose model answers slowly is named in the result and passed over by the next run', { options: OPTIONS }, async ($, on) => {
   withProfiles(on, { b: 80, c: 80, main: 80 })
   const homes: (string | undefined)[] = []

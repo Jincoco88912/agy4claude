@@ -71,7 +71,8 @@ skips agy's permission prompts. So a plan run is made read-only by agy4claude it
 - It installs an agy `PreToolUse` hook named `agy4claude-readonly` into the sign-in's
   `~/.gemini/config/hooks.json` (your other hooks stay as they are; the script is
   `~/.cache/agy4claude/readonly-hook.pl`). The hook does nothing unless the run carries
-  `AGY4CLAUDE_READONLY=1`, which only plan runs do, so your own `agy` sessions are not affected.
+  `AGY4CLAUDE_READONLY=1` (plan runs) or `AGY4CLAUDE_NO_COMMANDS=1` (accept-edits runs, below), so your
+  own `agy` sessions are not affected.
 - In a plan run the hook lets inspection commands through — `git diff`, `log`, `show`, `status`, `grep`,
   `blame`, `ls-files`…, `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `sed -n`, `sort`,
   `diff`, `jq` and the like, piped or chained — and denies everything else: tests, builds, installs,
@@ -135,11 +136,19 @@ to verify anything that must be current itself.
    | `default_cwd` | session folder | Where agy runs when a call names none |
    | `agent`, `sandbox` | — | Default `--agent`, and `--sandbox` on every run |
 
+## Edits without commands (`mode: "accept-edits"`)
+
+agy's own `--mode accept-edits` does **not** stop commands when runs skip permission prompts: in a test
+on 2026-10-20 it ran `touch` and `ls` as usual. So agy4claude gates it with the same hook: an accept-edits
+run carries `AGY4CLAUDE_NO_COMMANDS=1`, and the hook denies every `run_command` and `send_command_input`
+while the file-editing tools go through. agy is told why and says in its answer which commands should be
+run afterwards. Without perl (Windows) the run is only asked, in its prompt, not to run commands.
+
 ## Safety notes
 
 - agy runs with `--dangerously-skip-permissions` in the working directory: it edits files and runs
   commands without asking. Give it a clear scope, or use `mode: "plan"` (read-only, see above) or
-  `mode: "accept-edits"` (agy's mode for edits without commands; agy4claude does not enforce it).
+  `mode: "accept-edits"` (edits, no commands, see below).
 - On macOS, a sign-in folder used as `HOME` has no keychain, and agy may trigger a system dialog
   *"A keychain cannot be found to store 'antigravity'"*. Choose **Cancel** — never *Reset To Defaults*,
   which replaces your login keychain with an empty one. Runs work either way.

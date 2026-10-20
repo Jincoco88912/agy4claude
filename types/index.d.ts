@@ -68,6 +68,8 @@ export type AgyRun = AgyLaunch & {
   partial?: string
   /** How a plan run was kept read-only: by the agy hook, or only by asking in the prompt (no perl). */
   readOnly?: 'hook' | 'prompt'
+  /** How an accept-edits run was kept from running commands: by the agy hook, or only by asking in the prompt. */
+  noCommands?: 'hook' | 'prompt'
   /** Seconds the model took over its finished turns, and how many, to tell a slow sign-in. */
   modelSeconds?: number
   modelTurns?: number

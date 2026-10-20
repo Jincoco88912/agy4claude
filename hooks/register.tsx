@@ -852,8 +852,14 @@ const loadModels = async ($: EngineInterface): Promise<AgyModel[]> => {
 // prompt. So a plan run carries AGY4CLAUDE_READONLY=1, and an agy PreToolUse hook installed in the
 // sign-in's ~/.gemini/config/hooks.json denies anything but inspection commands (see readonly.ts).
 // Without perl (Windows) the run is only asked, in its prompt, to change nothing.
+// Same for mode "accept-edits": agy's own mode still runs commands under --dangerously-skip-permissions
+// (checked 2026-10-20), so those runs carry AGY4CLAUDE_NO_COMMANDS=1 and the hook denies every command.
 
 const READONLY_ENV = 'AGY4CLAUDE_READONLY'
+const NO_COMMANDS_ENV = 'AGY4CLAUDE_NO_COMMANDS'
+const NO_COMMANDS_NOTE =
+  'This run may edit files but may not run commands (they are blocked): edit with the file tools, and say in your answer ' +
+  'which commands (tests, builds, installs) should be run afterwards.\n\n'
 const READONLY_NOTE =
   'This is a read-only run: inspect and report only. Do not edit or create files, and do not run tests, builds, installs, ' +
   'formatters or any command that changes something (they are blocked); read the code instead and say what you would run. ' +
@@ -957,6 +963,7 @@ const summarize = (run: AgyRun, stderr: string): string => {
     run.conversation ? `conversation ${run.conversation}` : null,
     ...launchTags(run),
     run.readOnly ? `read-only (${run.readOnly === 'hook' ? 'enforced by hook' : 'asked in the prompt only'})` : null,
+    run.noCommands ? `no commands (${run.noCommands === 'hook' ? 'enforced by hook' : 'asked in the prompt only'})` : null,
     toolsUsed.length ? `tools: ${toolsUsed.join(', ')}` : null,
     run.usage ? `${run.usage.total} tokens` : null,
     (run.modelTurns ?? 0) >= 2 ? `model ~${Math.round(avg)}s per turn` : null,
@@ -1126,7 +1133,7 @@ const DELEGATION_GUIDE =
   'wants a second implementation or opinion from it, or wants work to proceed in parallel while you continue. ' +
   'Write the prompt as a complete instruction with the paths it needs; it runs with permissions bypassed in the given working directory. ' +
   'Use mode "plan" when only a plan, review or research is wanted and nothing should change: it is read-only (inspection commands such as git diff and grep run; edits, tests and builds are blocked). ' +
-  '"accept-edits" when it may edit files but should not run commands. ' +
+  '"accept-edits" when it may edit files but should not run commands (all commands are blocked). ' +
   'Each agy step can take from a few seconds to over a minute, so keep a task small: split a large review (a long diff, many files) into several runs of a few files each, ' +
   'and say which files to read rather than asking it to explore. A run that hits its time limit returns what agy had found so far. ' +
   'Use json_schema when you will parse its answer. ' +
@@ -1283,8 +1290,11 @@ async function runTask($: EngineInterface, input: RunInput, prompt: string, next
     await $.store.set('lastAccount', account)
     await shareGitConfig($, account)
     const readOnly = launch.mode === 'plan' ? ((await prepareReadOnly($, account)) ? 'hook' as const : 'prompt' as const) : undefined
+    const noCommands = launch.mode === 'accept-edits' ? ((await prepareReadOnly($, account)) ? 'hook' as const : 'prompt' as const) : undefined
     const accountEnv = await envFor($, account)
-    const env = readOnly ? { ...(accountEnv ?? {}), [READONLY_ENV]: '1' } : accountEnv
+    const env = readOnly
+      ? { ...(accountEnv ?? {}), [READONLY_ENV]: '1' }
+      : noCommands ? { ...(accountEnv ?? {}), [NO_COMMANDS_ENV]: '1' } : accountEnv
     stderr = ''
     const job = attempt === 0 ? firstJob : newJob()
 
@@ -1292,12 +1302,13 @@ async function runTask($: EngineInterface, input: RunInput, prompt: string, next
       ...launch,
       job, account, prompt, cwd, conversation, status: 'starting', phase: 'starting agy', startedAt: handedAt, steps: [], text: '', limitMinutes: minutes,
       ...(readOnly ? { readOnly } : {}),
+      ...(noCommands ? { noCommands } : {}),
     }
     const save = () => saveRun($, current)
     await save()
     $.ui.status('agy: running')
 
-    const argv = argvFor({ ...launch, prompt: readOnly ? `${READONLY_NOTE}${prompt}` : prompt, conversation, timeout, jsonSchema })
+    const argv = argvFor({ ...launch, prompt: readOnly ? `${READONLY_NOTE}${prompt}` : noCommands ? `${NO_COMMANDS_NOTE}${prompt}` : prompt, conversation, timeout, jsonSchema })
     const me = claim
     me.job = job
     if (next.signal.aborted || me.cancelled) {
@@ -1455,7 +1466,7 @@ export const register: Register = (on, rawOptions) => {
           conversation: { type: 'string', description: 'An explicit agy conversation id to resume.' },
           model: { type: 'string', description: 'agy --model slug; empty uses the configured default.' },
           effort: { type: 'string', enum: [...EFFORTS], description: 'Reasoning effort for this run; empty uses the configured default.' },
-          mode: { type: 'string', enum: [...MODES], description: '"plan": read-only (reviews, research, plans): agy may read files and run inspection commands such as git diff, grep or ls; edits, tests, builds and installs are blocked. "accept-edits": agy may edit files but not run commands. Empty: full access.' },
+          mode: { type: 'string', enum: [...MODES], description: '"plan": read-only (reviews, research, plans): agy may read files and run inspection commands such as git diff, grep or ls; edits, tests, builds and installs are blocked. "accept-edits": agy may edit files; every command is blocked. Empty: full access.' },
           agent: { type: 'string', description: 'Name of an agent defined in agy (see `agy agents`) to run the task with.' },
           project: { type: 'string', description: 'agy project id or name for this run.' },
           add_dirs: { type: 'array', items: { type: 'string' }, description: 'Extra directories agy may read and edit besides cwd.' },

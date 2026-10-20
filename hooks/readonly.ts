@@ -1,7 +1,9 @@
-// agy4claude's read-only gate for mode "plan": an agy PreToolUse hook (perl, which macOS and Linux ship).
-// agy has no read-only flag (its --mode plan only plans first), and every run skips its permission prompts,
-// so this hook is what keeps a plan run from changing anything. It is installed into each sign-in's
-// ~/.gemini/config/hooks.json and does nothing unless AGY4CLAUDE_READONLY=1, which only plan runs carry.
+// agy4claude's tool gates: an agy PreToolUse hook (perl, which macOS and Linux ship).
+// agy has no read-only flag (its --mode plan only plans first), and its --mode accept-edits still runs
+// commands under --dangerously-skip-permissions (checked 2026-10-20). So this hook is what keeps a plan run
+// from changing anything (AGY4CLAUDE_READONLY=1) and an accept-edits run from running commands
+// (AGY4CLAUDE_NO_COMMANDS=1). It is installed into each sign-in's ~/.gemini/config/hooks.json and
+// does nothing, and prints nothing, unless one of those switches is set: agy reads a bare `{}` as a denial.
 
 export const READONLY_HOOK_NAME = 'agy4claude-readonly'
 
@@ -9,9 +11,11 @@ export const READONLY_HOOK_NAME = 'agy4claude-readonly'
 export const READONLY_MATCHER = 'run_command|write_to_file|replace_file_content|multi_replace_file_content|edit_file|create_file|write_file|delete_file|code_action|send_command_input'
 
 export const READONLY_HOOK = String.raw`#!/usr/bin/perl
-# agy4claude read-only gate: an agy PreToolUse hook. It does nothing unless AGY4CLAUDE_READONLY=1,
-# which agy4claude sets only for runs with mode "plan"; then it lets inspection commands through
-# and denies everything that could change something (tests, builds, installs, writes, edits).
+# agy4claude tool gate: an agy PreToolUse hook. It does nothing unless AGY4CLAUDE_READONLY=1 or
+# AGY4CLAUDE_NO_COMMANDS=1, which agy4claude sets only for runs with mode "plan" / "accept-edits".
+# READONLY: lets inspection commands through and denies everything that could change something
+# (tests, builds, installs, writes, edits). NO_COMMANDS: denies every command, lets edits through.
+# "No opinion" is no output at all (a bare {} is read by agy as a denial).
 use strict;
 use warnings;
 use JSON::PP;
@@ -19,7 +23,9 @@ use JSON::PP;
 my $raw = do { local $/; <STDIN> } // '';
 my $json = JSON::PP->new->canonical;
 sub out { print $json->encode($_[0]), "\n"; exit 0 }
-out({}) unless ($ENV{AGY4CLAUDE_READONLY} // '') eq '1';
+my $readonly = ($ENV{AGY4CLAUDE_READONLY} // '') eq '1';
+my $nocmd = ($ENV{AGY4CLAUDE_NO_COMMANDS} // '') eq '1';
+exit 0 unless $readonly || $nocmd;
 
 my $in = eval { $json->decode($raw) } || {};
 my $call = $in->{toolCall} || {};
@@ -34,8 +40,13 @@ for my $k (keys %$args) {
   }
 }
 
-my $WHY = 'agy4claude plan mode is read-only';
+my $WHY = $readonly ? 'agy4claude plan mode is read-only' : 'agy4claude accept-edits mode does not run commands';
 sub deny { out({ decision => 'deny', reason => "$WHY: $_[0]" }) }
+
+if (!$readonly) {
+  exit 0 unless $name eq 'run_command' || $name eq 'send_command_input';
+  deny('edit files with the file tools, and say in your answer which commands should be run');
+}
 
 my %EDIT = map { $_ => 1 } qw(write_to_file replace_file_content multi_replace_file_content edit_file create_file write_file delete_file code_action send_command_input);
 if ($EDIT{$name}) {
@@ -46,7 +57,7 @@ if ($EDIT{$name}) {
     if !@paths || grep { index($_, $own) != 0 || m{/\.\./} } @paths;
   out({ decision => 'allow' });
 }
-out({}) unless $name eq 'run_command';
+exit 0 unless $name eq 'run_command';
 
 my $line = $args->{CommandLine} // $args->{command} // '';
 my $verdict = check($line);
